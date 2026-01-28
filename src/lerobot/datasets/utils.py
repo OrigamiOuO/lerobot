@@ -730,6 +730,8 @@ def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFea
             type = FeatureType.STATE
         elif key.startswith(ACTION):
             type = FeatureType.ACTION
+        elif key.startswith(OBS_STR) and key.endswith(".tactile"):
+            type = FeatureType.TACTILE
         else:
             continue
 

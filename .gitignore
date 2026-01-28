@@ -177,3 +177,18 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+# Dataset folders
+datasets/
+
+# checkpoints
+checkpoints/
+
+# results
+results/
+
+xiyan_doc/
+
+copilt_test_scripts/
+
+config/

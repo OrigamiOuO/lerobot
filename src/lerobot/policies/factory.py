@@ -131,6 +131,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.wall_x.modeling_wall_x import WallXPolicy
 
         return WallXPolicy
+    elif name == "tactile_diffusion":
+        from lerobot.policies.tactile_diffusion.modeling_tactile_diffusion import TactileDiffusionPolicy
+
+        return TactileDiffusionPolicy
     else:
         try:
             return _get_policy_cls_from_policy_name(name=name)

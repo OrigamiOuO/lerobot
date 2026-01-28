@@ -24,6 +24,7 @@ from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
 from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig as WallXConfig
 from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
+from .tactile_diffusion.configuration_tactile_diffusion import TactileDiffusionConfig as TactileDiffusionConfig
 
 __all__ = [
     "ACTConfig",
@@ -38,4 +39,5 @@ __all__ = [
     "GrootConfig",
     "XVLAConfig",
     "WallXConfig",
+    "TactileDiffusionConfig",
 ]
