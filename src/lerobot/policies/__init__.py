@@ -25,6 +25,7 @@ from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig as WallXConfig
 from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 from .tactile_diffusion.configuration_tactile_diffusion import TactileDiffusionConfig as TactileDiffusionConfig
+from .tactile_blind_diffusion.configuration_tactile_blind_diffusion import TactileDiffusionConfig as TactileBlindDiffusionConfig
 
 __all__ = [
     "ACTConfig",
@@ -40,4 +41,5 @@ __all__ = [
     "XVLAConfig",
     "WallXConfig",
     "TactileDiffusionConfig",
+    "TactileBlindDiffusionConfig",
 ]

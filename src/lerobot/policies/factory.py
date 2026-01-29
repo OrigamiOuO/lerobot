@@ -135,6 +135,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.tactile_diffusion.modeling_tactile_diffusion import TactileDiffusionPolicy
 
         return TactileDiffusionPolicy
+    elif name == "tactile_blind_diffusion":
+        from lerobot.policies.tactile_blind_diffusion.modeling_tactile_blind_diffusion import TactileDiffusionPolicy
+
+        return TactileDiffusionPolicy
     else:
         try:
             return _get_policy_cls_from_policy_name(name=name)
