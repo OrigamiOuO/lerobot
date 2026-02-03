@@ -33,23 +33,28 @@ from torch import Tensor, nn
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
-from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.tactile_act.configuration_tactile_act import TactileACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 
-class ACTPolicy(PreTrainedPolicy):
+# Define constants for tactile observations
+OBS_TACTILE1 = "observation.tactile_fsr"
+OBS_TACTILE2 = "observation.tactile_taxel"
+
+
+class TactileACTPolicy(PreTrainedPolicy):
     """
-    Action Chunking Transformer Policy as per Learning Fine-Grained Bimanual Manipulation with Low-Cost
-    Hardware (paper: https://huggingface.co/papers/2304.13705, code: https://github.com/tonyzhaozh/act)
+    Tactile Action Chunking Transformer Policy with multi-frame history support.
+    Based on ACT (https://huggingface.co/papers/2304.13705) with tactile sensor integration.
     """
 
-    config_class = ACTConfig
-    name = "act"
+    config_class = TactileACTConfig
+    name = "tactile_act"
 
     def __init__(
         self,
-        config: ACTConfig,
+        config: TactileACTConfig,
         **kwargs,
     ):
         """
@@ -95,6 +100,13 @@ class ACTPolicy(PreTrainedPolicy):
             self.temporal_ensembler.reset()
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
+        
+        # Initialize observation queues for multi-frame history
+        self._obs_queues = {
+            OBS_STATE: deque(maxlen=self.config.n_obs_steps),
+            OBS_TACTILE1: deque(maxlen=self.config.n_obs_steps),
+            OBS_TACTILE2: deque(maxlen=self.config.n_obs_steps),
+        }
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -125,6 +137,42 @@ class ACTPolicy(PreTrainedPolicy):
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         self.eval()
+
+        # Handle multi-frame history for inference
+        # During training, data loader provides (B, n_obs_steps, features)
+        # During inference, we get single frames and need to stack them
+        if OBS_STATE in batch and batch[OBS_STATE].ndim == 2:
+            # Single frame inference - need to build history with queues
+            # Update queues
+            self._obs_queues[OBS_STATE].append(batch[OBS_STATE])
+            if self.config.use_tactile_features:
+                self._obs_queues[OBS_TACTILE1].append(batch[OBS_TACTILE1])
+                self._obs_queues[OBS_TACTILE2].append(batch[OBS_TACTILE2])
+            
+            # Stack queued observations
+            if len(self._obs_queues[OBS_STATE]) == self.config.n_obs_steps:
+                batch = dict(batch)  # shallow copy
+                batch[OBS_STATE] = torch.stack(list(self._obs_queues[OBS_STATE]), dim=1)
+                if self.config.use_tactile_features:
+                    batch[OBS_TACTILE1] = torch.stack(list(self._obs_queues[OBS_TACTILE1]), dim=1)
+                    batch[OBS_TACTILE2] = torch.stack(list(self._obs_queues[OBS_TACTILE2]), dim=1)
+            else:
+                # Not enough history yet - pad with first observation
+                batch = dict(batch)  # shallow copy
+                obs_list = list(self._obs_queues[OBS_STATE])
+                # Pad with repeating the first observation
+                while len(obs_list) < self.config.n_obs_steps:
+                    obs_list.insert(0, obs_list[0])
+                batch[OBS_STATE] = torch.stack(obs_list, dim=1)
+                
+                if self.config.use_tactile_features:
+                    tactile1_list = list(self._obs_queues[OBS_TACTILE1])
+                    tactile2_list = list(self._obs_queues[OBS_TACTILE2])
+                    while len(tactile1_list) < self.config.n_obs_steps:
+                        tactile1_list.insert(0, tactile1_list[0])
+                        tactile2_list.insert(0, tactile2_list[0])
+                    batch[OBS_TACTILE1] = torch.stack(tactile1_list, dim=1)
+                    batch[OBS_TACTILE2] = torch.stack(tactile2_list, dim=1)
 
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
@@ -288,7 +336,7 @@ class ACT(nn.Module):
                                 └───────────────────────┘
     """
 
-    def __init__(self, config: ACTConfig):
+    def __init__(self, config: TactileACTConfig):
         # BERT style VAE encoder with input tokens [cls, robot_state, *action_sequence].
         # The cls token forms parameters of the latent's distribution (like this [*means, *log_variances]).
         super().__init__()
@@ -331,15 +379,32 @@ class ACT(nn.Module):
             # Note: The forward method of this returns a dict: {"feature_map": output}.
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
 
+        # Tactile encoder for processing FSR and taxel sensor data.
+        if self.config.use_tactile_features:
+            # FSR: 12D, Taxel: 32D, Total: 44D -> encode to tactile_encoder_hidden_dim
+            self.tactile_encoder = nn.Sequential(
+                nn.Linear(44, self.config.tactile_encoder_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(self.config.tactile_encoder_hidden_dim, self.config.tactile_encoder_hidden_dim)
+            )
+
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
         self.decoder = ACTDecoder(config)
 
         # Transformer encoder input projections. The tokens will be structured like
-        # [latent, (robot_state), (env_state), (image_feature_map_pixels)].
+        # [latent, (robot_state + tactile), (env_state), (image_feature_map_pixels)].
+        # Note: For multi-frame history (n_obs_steps > 1), we flatten the temporal dimension
+        # into the feature dimension. E.g., (B, 2, 22) -> (B, 44) before projection.
         if self.config.robot_state_feature:
+            state_dim = self.config.robot_state_feature.shape[0]
+            # Add tactile dimension if enabled
+            if self.config.use_tactile_features:
+                total_input_dim = (state_dim + self.config.tactile_encoder_hidden_dim) * self.config.n_obs_steps
+            else:
+                total_input_dim = state_dim * self.config.n_obs_steps
             self.encoder_robot_state_input_proj = nn.Linear(
-                self.config.robot_state_feature.shape[0], config.dim_model
+                total_input_dim, config.dim_model
             )
         if self.config.env_state_feature:
             self.encoder_env_state_input_proj = nn.Linear(
@@ -375,6 +440,51 @@ class ACT(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
+    def _prepare_state_and_tactile(self, batch: dict[str, Tensor]) -> Tensor:
+        """Prepare multi-frame state and tactile features for the transformer encoder.
+        
+        Args:
+            batch: Dictionary containing observation data with shapes:
+                - batch[OBS_STATE]: (B, n_obs_steps, state_dim) 
+                - batch[OBS_TACTILE1]: (B, n_obs_steps, 12) if tactile enabled
+                - batch[OBS_TACTILE2]: (B, n_obs_steps, 32) if tactile enabled
+        
+        Returns:
+            Flattened feature tensor: (B, n_obs_steps * (state_dim + tactile_encoded_dim))
+        """
+        batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
+        
+        # Start with state features
+        state_features = batch[OBS_STATE]  # (B, n_obs_steps, state_dim)
+        
+        if self.config.use_tactile_features:
+            # Concatenate FSR and taxel data
+            tactile_fsr = batch[OBS_TACTILE1]      # (B, n_obs_steps, 12)
+            tactile_taxel = batch[OBS_TACTILE2]    # (B, n_obs_steps, 32)
+            tactile_concat = torch.cat([tactile_fsr, tactile_taxel], dim=-1)  # (B, n_obs_steps, 44)
+            
+            # Flatten batch and time for encoding
+            tactile_flat = einops.rearrange(tactile_concat, "b s d -> (b s) d")  # (B*n_obs_steps, 44)
+            tactile_encoded = self.tactile_encoder(tactile_flat)  # (B*n_obs_steps, hidden_dim)
+            
+            # Restore batch and time dimensions
+            tactile_encoded = einops.rearrange(
+                tactile_encoded, "(b s) d -> b s d", b=batch_size, s=n_obs_steps
+            )  # (B, n_obs_steps, hidden_dim)
+            
+            # Concatenate state and tactile
+            combined_features = torch.cat([state_features, tactile_encoded], dim=-1)
+            # (B, n_obs_steps, state_dim + hidden_dim)
+        else:
+            combined_features = state_features
+        
+        # Flatten temporal dimension into feature dimension
+        flattened = combined_features.flatten(start_dim=1)
+        # (B, n_obs_steps * (state_dim + hidden_dim))
+        
+        return flattened
+
+
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
 
@@ -399,7 +509,14 @@ class ACT(nn.Module):
                 "actions must be provided when using the variational objective in training mode."
             )
 
-        batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
+        # Determine batch size from available inputs
+        if OBS_IMAGES in batch:
+            batch_size = batch[OBS_IMAGES][0].shape[0]
+        elif OBS_ENV_STATE in batch:
+            batch_size = batch[OBS_ENV_STATE].shape[0]
+        else:
+            # For tactile-only mode, use state feature
+            batch_size = batch[OBS_STATE].shape[0]
 
         # Prepare the latent for input to the transformer encoder.
         if self.config.use_vae and ACTION in batch and self.training:
@@ -408,7 +525,10 @@ class ACT(nn.Module):
                 self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size
             )  # (B, 1, D)
             if self.config.robot_state_feature:
-                robot_state_embed = self.vae_encoder_robot_state_input_proj(batch[OBS_STATE])
+                # For VAE encoder, use only the last frame (current timestep)
+                # batch[OBS_STATE] has shape (B, n_obs_steps, state_dim)
+                robot_state_current = batch[OBS_STATE][:, -1, :]  # (B, state_dim)
+                robot_state_embed = self.vae_encoder_robot_state_input_proj(robot_state_current)
                 robot_state_embed = robot_state_embed.unsqueeze(1)  # (B, 1, D)
             action_embed = self.vae_encoder_action_input_proj(batch[ACTION])  # (B, S, D)
 
@@ -458,9 +578,12 @@ class ACT(nn.Module):
         # Prepare transformer encoder inputs.
         encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
         encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
-        # Robot state token.
+        
+        # Robot state token (with optional tactile and multi-frame support).
         if self.config.robot_state_feature:
-            encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
+            state_and_tactile = self._prepare_state_and_tactile(batch)  # (B, flattened_dim)
+            encoder_in_tokens.append(self.encoder_robot_state_input_proj(state_and_tactile))
+        
         # Environment state token.
         if self.config.env_state_feature:
             encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
@@ -513,7 +636,7 @@ class ACT(nn.Module):
 class ACTEncoder(nn.Module):
     """Convenience module for running multiple encoder layers, maybe followed by normalization."""
 
-    def __init__(self, config: ACTConfig, is_vae_encoder: bool = False):
+    def __init__(self, config: TactileACTConfig, is_vae_encoder: bool = False):
         super().__init__()
         self.is_vae_encoder = is_vae_encoder
         num_layers = config.n_vae_encoder_layers if self.is_vae_encoder else config.n_encoder_layers
@@ -530,7 +653,7 @@ class ACTEncoder(nn.Module):
 
 
 class ACTEncoderLayer(nn.Module):
-    def __init__(self, config: ACTConfig):
+    def __init__(self, config: TactileACTConfig):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
 
@@ -569,7 +692,7 @@ class ACTEncoderLayer(nn.Module):
 
 
 class ACTDecoder(nn.Module):
-    def __init__(self, config: ACTConfig):
+    def __init__(self, config: TactileACTConfig):
         """Convenience module for running multiple decoder layers followed by normalization."""
         super().__init__()
         self.layers = nn.ModuleList([ACTDecoderLayer(config) for _ in range(config.n_decoder_layers)])
@@ -592,7 +715,7 @@ class ACTDecoder(nn.Module):
 
 
 class ACTDecoderLayer(nn.Module):
-    def __init__(self, config: ACTConfig):
+    def __init__(self, config: TactileACTConfig):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
         self.multihead_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)

@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 
-from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.tactile_act.configuration_tactile_act import TactileACTConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -31,8 +31,8 @@ from lerobot.processor.converters import policy_action_to_transition, transition
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 
-def make_act_pre_post_processors(
-    config: ACTConfig,
+def make_tactile_act_pre_post_processors(
+    config: TactileACTConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
@@ -44,7 +44,7 @@ def make_act_pre_post_processors(
     The post-processing pipeline handles unnormalization and moves the model outputs back to the CPU.
 
     Args:
-        config (ACTConfig): The ACT policy configuration object.
+        config (TactileACTConfig): The ACT policy configuration object.
         dataset_stats (dict[str, dict[str, torch.Tensor]] | None): A dictionary containing dataset
             statistics (e.g., mean and std) used for normalization. Defaults to None.
 
