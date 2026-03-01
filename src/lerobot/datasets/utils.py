@@ -639,7 +639,32 @@ def hw_to_dataset_features(
         for key, ftype in hw_features.items()
         if ftype is float or (isinstance(ftype, PolicyFeature) and ftype.type != FeatureType.VISUAL)
     }
-    cam_fts = {key: shape for key, shape in hw_features.items() if isinstance(shape, tuple)}
+    
+    # Categorize tuple-type features by shape:
+    # - RGB images: 3D with 3 channels (H, W, 3) and NOT tactile data → stored as video/image
+    # - Non-RGB 3D arrays: 3D with channels != 3, OR tactile data with 3 channels → stored as float32
+    # - 2D arrays: e.g., marker displacements (N, 2) → stored as float32
+    cam_fts = {}  # RGB images (H, W, 3)
+    array_3d_fts = {}  # Non-RGB 3D arrays like depth (H,W,1), normals (H,W,3)
+    array_2d_fts = {}  # 2D arrays like marker displacements (N, 2)
+    
+    # Names that indicate non-image array data (tactile, depth, normal, etc.)
+    non_image_keywords = ("tactile", "depth", "normal", "displacement", "force", "pressure")
+    
+    for key, shape in hw_features.items():
+        if not isinstance(shape, tuple):
+            continue
+        
+        # Check if this is a non-image array based on name
+        is_non_image = any(kw in key.lower() for kw in non_image_keywords)
+        
+        if len(shape) == 3:
+            if shape[2] == 3 and not is_non_image:  # RGB image
+                cam_fts[key] = shape
+            else:  # Non-RGB 3D array OR tactile/depth/normal data
+                array_3d_fts[key] = shape
+        elif len(shape) == 2:
+            array_2d_fts[key] = shape
 
     if joint_fts and prefix == ACTION:
         features[prefix] = {
@@ -655,11 +680,28 @@ def hw_to_dataset_features(
             "names": list(joint_fts),
         }
 
+    # RGB images (H, W, 3) → stored as video/image
     for key, shape in cam_fts.items():
         features[f"{prefix}.images.{key}"] = {
             "dtype": "video" if use_video else "image",
             "shape": shape,
             "names": ["height", "width", "channels"],
+        }
+
+    # Non-RGB 3D arrays (H, W, C) where C != 3, e.g., depth (H,W,1), normals (H,W,2)
+    for key, shape in array_3d_fts.items():
+        features[f"{prefix}.{key}"] = {
+            "dtype": "float32",
+            "shape": shape,
+            "names": None,
+        }
+
+    # 2D arrays (N, M), e.g., marker displacements (N, 2)
+    for key, shape in array_2d_fts.items():
+        features[f"{prefix}.{key}"] = {
+            "dtype": "float32",
+            "shape": shape,
+            "names": None,
         }
 
     _validate_feature_names(features)
@@ -687,12 +729,36 @@ def build_dataset_frame(
     for key, ft in ds_features.items():
         if key in DEFAULT_FEATURES or not key.startswith(prefix):
             continue
-        elif ft["dtype"] == "float32" and len(ft["shape"]) == 1:
-            frame[key] = np.array([values[name] for name in ft["names"]], dtype=np.float32)
+        elif ft["dtype"] == "float32":
+            if ft["names"] is not None:
+                # Joint states: collect individual values by name (1D with names)
+                frame[key] = np.array([values[name] for name in ft["names"]], dtype=np.float32)
+            else:
+                # Array features (1D, 2D, or 3D): get the whole array directly
+                # Examples: tactile_fsr (12,), marker_displacement (N,2), depth (H,W,1), normals (H,W,2)
+                short_key = key.removeprefix(f"{prefix}.")
+                frame[key] = np.array(values[short_key], dtype=np.float32)
         elif ft["dtype"] in ["image", "video"]:
             frame[key] = values[key.removeprefix(f"{prefix}.images.")]
 
     return frame
+
+
+# Keywords indicating tactile sensor data features
+TACTILE_KEYWORDS = ("tactile", "depth", "normal", "displacement", "force", "pressure", "marker")
+
+
+def _is_tactile_feature(key: str) -> bool:
+    """Check if a feature key represents tactile sensor data.
+    
+    Args:
+        key: The feature key name.
+        
+    Returns:
+        True if the key represents tactile data, False otherwise.
+    """
+    key_lower = key.lower()
+    return any(kw in key_lower for kw in TACTILE_KEYWORDS)
 
 
 def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFeature]:
@@ -726,12 +792,13 @@ def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFea
                 shape = (shape[2], shape[0], shape[1])
         elif key == OBS_ENV_STATE:
             type = FeatureType.ENV
+        elif _is_tactile_feature(key):
+            # Tactile features: depth maps, normal vectors, marker displacements, etc.
+            type = FeatureType.TACTILE
         elif key.startswith(OBS_STR):
             type = FeatureType.STATE
         elif key.startswith(ACTION):
             type = FeatureType.ACTION
-        elif key.startswith(OBS_STR) and key.endswith(".tactile"):
-            type = FeatureType.TACTILE
         else:
             continue
 

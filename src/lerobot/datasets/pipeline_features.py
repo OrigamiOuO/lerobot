@@ -97,6 +97,9 @@ def aggregate_pipeline_dataset_features(
     }
     images_token = OBS_IMAGES.split(".")[-1]
 
+    # Names that indicate non-image array data (tactile, depth, normal, etc.)
+    non_image_keywords = ("tactile", "depth", "normal", "displacement", "force", "pressure")
+
     # Iterate through all features transformed by the pipeline.
     for ptype, feats in all_features.items():
         if ptype not in [PipelineFeatureType.ACTION, PipelineFeatureType.OBSERVATION]:
@@ -105,10 +108,16 @@ def aggregate_pipeline_dataset_features(
         for key, value in feats.items():
             # 1. Categorize the feature.
             is_action = ptype == PipelineFeatureType.ACTION
-            # Observations are classified as images if their key matches image-related tokens or if the shape of the feature is 3.
-            # All other observations are treated as state.
-            is_image = not is_action and (
-                (isinstance(value, tuple) and len(value) == 3)
+            
+            # Check if this is a non-image array based on name keywords
+            is_non_image_array = any(kw in key.lower() for kw in non_image_keywords)
+            
+            # Observations are classified as images if:
+            # - Their shape is 3D with 3 channels (RGB image), AND
+            # - They are NOT explicitly named as non-image data (tactile, depth, etc.)
+            # OR if their key matches image-related tokens
+            is_image = not is_action and not is_non_image_array and (
+                (isinstance(value, tuple) and len(value) == 3 and value[2] == 3)
                 or (
                     key.startswith(f"{OBS_IMAGES}.")
                     or key.startswith(f"{images_token}.")

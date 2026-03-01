@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import TypeAlias
 
 from lerobot.cameras import CameraConfig
+from lerobot.cameras.tactile_cam.tactile_config import TactileCameraConfig
 
 from ..config import RobotConfig
 
@@ -38,6 +39,12 @@ class SOFollowerConfig:
 
     # cameras
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
+
+    # Tactile camera configuration (optional)
+    tactile_camera: TactileCameraConfig | None = None
+    
+    # Number of marker points for tactile sensor
+    num_markers: int = 35
 
     # Set to `True` for backward compatibility with previous policies/dataset
     use_degrees: bool = False
