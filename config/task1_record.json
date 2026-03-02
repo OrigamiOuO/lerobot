@@ -1,0 +1,45 @@
+{
+  "robot": {
+    "type": "so101_follower",
+    "port": "/dev/ttyACM0",
+    "id": "my_awesome_follower_arm",
+    "cameras": {
+      "global": {
+        "type": "opencv",
+        "index_or_path": "/dev/video2",
+        "width": 640,
+        "height": 480,
+        "fps": 30,
+        "warmup_s": 2
+      },
+      "inhand": {
+        "type": "opencv",
+        "index_or_path": "/dev/video0",
+        "width": 640,
+        "height": 480,
+        "fps": 30,
+        "warmup_s": 2
+      }
+    }
+  },
+  "teleop": {
+    "type": "so101_leader",
+    "port": "/dev/ttyACM1",
+    "id": "my_awesome_leader_arm"
+  },
+
+  "dataset": {
+    "repo_id": "hao_dp/no_tac_data",
+    "root": "./datasets/hao_dp/task1_v2",
+    "single_task": "Pick and Place",
+    "num_episodes": 10,
+    "fps": 30,
+    "episode_time_s": 9999,
+    "reset_time_s": 8,
+    "push_to_hub": false,
+    "num_image_writer_threads_per_camera": 4,
+    "video": true
+  },
+
+  "display_data": false
+}

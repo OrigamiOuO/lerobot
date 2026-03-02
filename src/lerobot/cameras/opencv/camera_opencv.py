@@ -20,6 +20,7 @@ import logging
 import math
 import os
 import platform
+import subprocess
 import time
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -234,11 +235,16 @@ class OpenCVCamera(Camera):
         if self.fps is None:
             raise ValueError(f"{self} FPS is not set")
 
-        success = self.videocapture.set(cv2.CAP_PROP_FPS, float(self.fps))
+        # 尝试设置 FPS（某些 Linux V4L2 驱动即使成功也可能返回 False）
+        self.videocapture.set(cv2.CAP_PROP_FPS, float(self.fps))
         actual_fps = self.videocapture.get(cv2.CAP_PROP_FPS)
-        # Use math.isclose for robust float comparison
-        if not success or not math.isclose(self.fps, actual_fps, rel_tol=1e-3):
-            raise RuntimeError(f"{self} failed to set fps={self.fps} ({actual_fps=}).")
+        
+        # 只检查实际 FPS 是否匹配，使用浮点容差比较
+        if not math.isclose(self.fps, actual_fps, rel_tol=0.1):  # 放宽容差到 10%
+            logger.warning(
+                f"{self} FPS mismatch: requested {self.fps}, actual {actual_fps:.1f}. Using actual FPS."
+            )
+            self.fps = actual_fps
 
     def _validate_fourcc(self) -> None:
         """Validates and sets the camera's FOURCC code."""
@@ -261,6 +267,51 @@ class OpenCVCamera(Camera):
                 f"Continuing with default format."
             )
 
+    def _set_resolution_via_v4l2(self, width: int, height: int) -> bool:
+        """
+        Attempts to set camera resolution using v4l2-ctl as a fallback when OpenCV fails.
+        
+        This is useful on Linux systems where V4L2 drivers may not respond properly to
+        OpenCV's CAP_PROP_FRAME_WIDTH/HEIGHT settings.
+        
+        Args:
+            width: Target width
+            height: Target height
+            
+        Returns:
+            True if v4l2-ctl command succeeded, False otherwise.
+        """
+        if platform.system() != "Linux":
+            return False
+            
+        # Convert device path to V4L2 device if needed
+        device_path = str(self.index_or_path)
+        if not device_path.startswith("/dev/"):
+            # If it's a device index, skip v4l2-ctl attempt
+            return False
+        
+        try:
+            # Step 1: Set resolution using v4l2-ctl
+            cmd = ["v4l2-ctl", "-d", device_path, "-v", f"width={width},height={height}"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            
+            if result.returncode != 0:
+                logger.warning(
+                    f"{self} v4l2-ctl failed to set resolution: {result.stderr}"
+                )
+                return False
+                
+            logger.info(f"{self} v4l2-ctl set resolution to {width}x{height}")
+            return True
+        except FileNotFoundError:
+            logger.warning(
+                f"{self} v4l2-ctl not found. Install v4l-utils: sudo apt-get install v4l-utils"
+            )
+            return False
+        except Exception as e:
+            logger.warning(f"{self} error calling v4l2-ctl: {e}")
+            return False
+
     def _validate_width_and_height(self) -> None:
         """Validates and sets the camera's frame capture width and height."""
 
@@ -270,20 +321,75 @@ class OpenCVCamera(Camera):
         if self.capture_width is None or self.capture_height is None:
             raise ValueError(f"{self} capture_width or capture_height is not set")
 
-        width_success = self.videocapture.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.capture_width))
-        height_success = self.videocapture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.capture_height))
+        # 尝试使用 OpenCV 设置分辨率（某些 Linux V4L2 驱动即使成功也可能返回 False）
+        self.videocapture.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.capture_width))
+        self.videocapture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.capture_height))
 
+        # 以实际读取的分辨率为准，而非 set() 的返回值
         actual_width = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_WIDTH)))
-        if not width_success or self.capture_width != actual_width:
-            raise RuntimeError(
-                f"{self} failed to set capture_width={self.capture_width} ({actual_width=}, {width_success=})."
-            )
-
         actual_height = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-        if not height_success or self.capture_height != actual_height:
-            raise RuntimeError(
-                f"{self} failed to set capture_height={self.capture_height} ({actual_height=}, {height_success=})."
+
+        # 如果 OpenCV 无法设置分辨率，尝试使用 v4l2-ctl 作为后备方案
+        if self.capture_width != actual_width or self.capture_height != actual_height:
+            logger.warning(
+                f"{self} OpenCV failed to set resolution to ({self.capture_width}x{self.capture_height}), "
+                f"actual is ({actual_width}x{actual_height}). Attempting v4l2-ctl fallback..."
             )
+            
+            # 关闭 VideoCapture 对象，让驱动释放设备
+            if self.videocapture is not None:
+                self.videocapture.release()
+                self.videocapture = None
+            
+            # 等待驱动释放设备
+            time.sleep(1)
+            
+            # 尝试使用 v4l2-ctl 强制设置分辨率
+            v4l2_success = self._set_resolution_via_v4l2(self.capture_width, self.capture_height)
+            
+            if v4l2_success:
+                # 等待驱动应用新的分辨率
+                time.sleep(0.5)
+                
+                # 重新打开摄像头
+                self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
+                if not self.videocapture.isOpened():
+                    raise ConnectionError(f"Failed to reopen {self} after v4l2-ctl resolution change")
+                
+                # 验证新的分辨率
+                actual_width = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_WIDTH)))
+                actual_height = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+                
+                if self.capture_width == actual_width and self.capture_height == actual_height:
+                    logger.info(f"{self} resolution successfully set to {actual_width}x{actual_height}")
+                else:
+                    logger.warning(
+                        f"{self} resolution still mismatched after v4l2-ctl: requested ({self.capture_width}x{self.capture_height}), "
+                        f"actual ({actual_width}x{actual_height}). Using actual resolution."
+                    )
+                    self.capture_width = actual_width
+                    self.capture_height = actual_height
+            else:
+                # v4l2-ctl 失败或不可用，尝试使用实际分辨率重新打开
+                logger.warning(
+                    f"{self} v4l2-ctl fallback failed. Reopening with actual resolution..."
+                )
+                
+                # 重新打开摄像头以读取实际分辨率
+                self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
+                if not self.videocapture.isOpened():
+                    raise ConnectionError(f"Failed to reopen {self}")
+                
+                actual_width = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_WIDTH)))
+                actual_height = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+                
+                logger.warning(
+                    f"{self} using actual resolution: {actual_width}x{actual_height}. "
+                    f"Consider manually setting resolution with: "
+                    f"v4l2-ctl -d {self.index_or_path} -v width={self.capture_width},height={self.capture_height}"
+                )
+                self.capture_width = actual_width
+                self.capture_height = actual_height
 
     @staticmethod
     def find_cameras() -> list[dict[str, Any]]:
