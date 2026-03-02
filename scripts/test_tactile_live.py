@@ -96,7 +96,6 @@ def main():
     parser.add_argument("--wb", type=int, default=4000, help="白平衡色温")
     parser.add_argument("--num-markers", type=int, default=35, help="marker 数量")
     parser.add_argument("--threshold", type=float, default=6, help="marker 位移阈值 (像素), 低于此值视为噪声归零")
-    parser.add_argument("--depth-threshold", type=float, default=0, help="深度阈值, 绝对值低于此值归零 (抑制无接触噪声)")
     parser.add_argument("--save-dir", type=str, default=None, help="保存目录 (默认 outputs/tactile_test)")
     args = parser.parse_args()
 
@@ -138,7 +137,6 @@ def main():
         pad=20,
         calib_file=calib_file if os.path.exists(calib_file) else None,
         ppmm=ppmm,
-        depth_threshold=args.depth_threshold,
     )
     tracker = GelSightMarkerTracker()
     tracker.IsDisplay = False
@@ -149,7 +147,6 @@ def main():
 
     camera.connect()
     print("[INFO] 相机已连接")
-    print(f"[INFO] marker阈值={args.threshold}px  深度阈值={args.depth_threshold}")
     print("\n=== 触觉传感器实时测试 ===")
     print("  r - 重置背景 + marker    m - 重置 marker 位置")
     print("  s - 保存数据              q - 退出")
