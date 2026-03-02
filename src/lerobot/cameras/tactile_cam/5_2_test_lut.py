@@ -22,7 +22,7 @@ def main():
     
     # 相机配置（与 1_quick_roi_calibrator.py 一致）
     camera_config = TactileCameraConfig(
-        index_or_path="/dev/video2",  # 替换为你的TactileCamera设备路径
+        index_or_path="/dev/video0",  # 替换为你的TactileCamera设备路径
         fps=25,
         width=320,
         height=240,

@@ -1,17 +1,17 @@
 """
-MLP方法测试脚本（梯度角度版本）
+MLP方法测试脚本 (v2 - 与gs_sdk一致)
 
 使用训练好的MLP模型实时处理触觉传感器图像，
 计算深度图和法向量图。
 
 与 gs_sdk 的 Reconstructor 逻辑一致：
-1. 加载背景图，计算背景梯度角度
-2. 计算当前帧梯度角度，减去背景得到差分梯度
+1. 加载背景图，计算背景梯度
+2. 计算当前帧梯度，减去背景梯度得到差分梯度
 3. 使用泊松方程重建深度
 
 使用方法:
-1. 先运行 6_1_collect_mlp_dataset_angle.py 收集数据
-2. 运行 6_2_train_mlp_angle.py 训练模型
+1. 先运行 6_1_collect_mlp_dataset_v2.py 收集数据
+2. 运行 6_2_train_mlp_v2.py 训练模型
 3. 运行本脚本测试效果
 """
 
@@ -26,16 +26,40 @@ import pyvista as pv
 from scipy import fftpack
 import math
 
+# 确保可以导入 lerobot 模块
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+_src_dir = os.path.abspath(os.path.join(_current_dir, "..", "..", ".."))
+if _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
+
 from lerobot.cameras.tactile_cam.tactile_camera import TactileCamera
 from lerobot.cameras.tactile_cam.tactile_config import TactileCameraConfig
 from lerobot.cameras.tactile_cam.processors import BaseProcessor
 from lerobot.cameras.tactile_cam.visualization import TactileVisualizer
 from lerobot.cameras.tactile_cam.gelsight_marker_tracker import GelSightMarkerTracker
-from lerobot.cameras.tactile_cam.model import BGRXYMLPNet
 from lerobot.cameras.configs import ColorMode, Cv2Rotation
 
 
+class BGRXYMLPNet(nn.Module):
+    """与gs_sdk一致的MLP网络结构"""
+    def __init__(self):
+        super(BGRXYMLPNet, self).__init__()
+        input_size = 5
+        self.fc1 = nn.Linear(input_size, 128)
+        self.fc2 = nn.Linear(128, 32)
+        self.fc3 = nn.Linear(32, 32)
+        self.fc4 = nn.Linear(32, 2)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        x = self.fc4(x)
+        return x
+
+
 def image2bgrxys(image: np.ndarray) -> np.ndarray:
+    """将BGR图像转换为BGRXY特征 (与gs_sdk一致)"""
     h, w = image.shape[:2]
     ys = np.linspace(0, 1, h, endpoint=False, dtype=np.float32)
     xs = np.linspace(0, 1, w, endpoint=False, dtype=np.float32)
@@ -49,7 +73,7 @@ def image2bgrxys(image: np.ndarray) -> np.ndarray:
 
 def poisson_dct_neumann(gx: np.ndarray, gy: np.ndarray) -> np.ndarray:
     """
-    使用DCT的泊松求解器 
+    使用DCT的泊松求解器 (与gs_sdk一致)
     
     Args:
         gx: X方向梯度 (H, W)
@@ -113,7 +137,10 @@ def poisson_dct_neumann(gx: np.ndarray, gy: np.ndarray) -> np.ndarray:
     return img_tt
 
 
-class Reconstructor:
+class ReconstructorV2:
+    """
+    与gs_sdk一致的重建器
+    """
     def __init__(self, model_path: str, device: str = "cpu"):
         """
         初始化重建器
@@ -192,7 +219,6 @@ class Reconstructor:
         
         # 计算深度图
         H = poisson_dct_neumann(G[:, :, 0], G[:, :, 1]).astype(np.float32)
-
         
         # 计算接触掩膜
         diff_image = image.astype(np.float32) - self.bg_image.astype(np.float32)
@@ -210,7 +236,10 @@ class Reconstructor:
         return G, H, C
 
 
-class MLPProcessor(BaseProcessor):
+class MLPProcessorV2(BaseProcessor):
+    """
+    基于MLP的触觉图像处理器 (v2 - 与gs_sdk一致)
+    """
     
     def __init__(self, model_path: str = None, pad: int = 20,
                  calib_file: str = None, device: str = None, ppmm: float = 7.6):
@@ -242,10 +271,10 @@ class MLPProcessor(BaseProcessor):
         # 加载模型
         if model_path is None:
             current_dir = os.path.dirname(os.path.abspath(__file__))
-            model_path = os.path.join(current_dir, "load", "mlp_angle_model.pth")
+            model_path = os.path.join(current_dir, "load", "nnmodel_v2.pth")
         
         try:
-            self.reconstructor = Reconstructor(model_path, self.device)
+            self.reconstructor = ReconstructorV2(model_path, self.device)
         except Exception as e:
             print(f"[ERROR] 加载模型失败: {e}")
             self.reconstructor = None
@@ -371,12 +400,87 @@ class MLPProcessor(BaseProcessor):
         return depth_colored, normal_colored, grad_colored, H, G, C
 
 
+def visualize_marker_displacement(frame: np.ndarray, tracker: GelSightMarkerTracker, 
+                                   show_scale: float = 6) -> np.ndarray:
+    """
+    可视化marker位移
+    
+    Args:
+        frame: 当前帧 (BGR)
+        tracker: GelSightMarkerTracker 实例
+        show_scale: 位移显示缩放倍数
+        
+    Returns:
+        带有marker位移箭头的可视化图像
+    """
+    vis_img = frame.copy()
+    
+    if tracker.flowcenter is None or len(tracker.flowcenter) == 0:
+        return vis_img
+    
+    if tracker.markerU is None or tracker.markerV is None:
+        return vis_img
+    
+    # 获取marker中心坐标
+    marker_centers = np.around(tracker.flowcenter[:, 0:2]).astype(np.int16)
+    
+    # 绘制每个marker的位移箭头
+    for i in range(min(tracker.MarkerCount, len(marker_centers))):
+        if i >= len(tracker.markerU) or i >= len(tracker.markerV):
+            break
+            
+        cx, cy = marker_centers[i, 0], marker_centers[i, 1]
+        dx, dy = tracker.markerU[i], tracker.markerV[i]
+        
+        # 计算位移大小
+        displacement = np.sqrt(dx**2 + dy**2)
+        
+        # 绘制marker中心点
+        if displacement < 0.5:
+            # 无明显位移，绘制绿色小圆点
+            cv2.circle(vis_img, (cx, cy), 2, (0, 255, 0), -1)
+        else:
+            # 有位移，绘制红色箭头
+            end_x = int(cx + dx * show_scale)
+            end_y = int(cy + dy * show_scale)
+            
+            # 根据位移大小调整颜色 (越大越红)
+            color_intensity = min(255, int(displacement * 30))
+            color = (0, 255 - color_intensity, color_intensity)
+            
+            # 绘制箭头
+            cv2.arrowedLine(vis_img, (cx, cy), (end_x, end_y), 
+                           (0, 255, 255), 3, tipLength=0.2)
+            # 绘制起点
+            cv2.circle(vis_img, (cx, cy), 3, (0, 0, 255), -1)
+    
+    # 添加统计信息
+    displacements = tracker.get_marker_displacements()
+    if displacements is not None:
+        total_displacement = np.sqrt(displacements[:, 0]**2 + displacements[:, 1]**2)
+        avg_disp = np.mean(total_displacement)
+        max_disp = np.max(total_displacement)
+        moving_count = np.sum(total_displacement > 1.0)
+        
+        # 显示统计信息
+        cv2.putText(vis_img, f"Markers: {tracker.MarkerCount}", 
+                   (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(vis_img, f"Avg Disp: {avg_disp:.2f}px", 
+                   (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(vis_img, f"Max Disp: {max_disp:.2f}px", 
+                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(vis_img, f"Moving: {moving_count}", 
+                   (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    
+    return vis_img
+
+
 def main():
     """主函数"""
     
     # 相机配置
     camera_config = TactileCameraConfig(
-        index_or_path="/dev/video2",
+        index_or_path="/dev/video0",
         fps=25,
         width=640,
         height=480,
@@ -393,7 +497,7 @@ def main():
     
     # 数据保存目录
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    save_dir = os.path.join(current_dir, "data", "tactile_data_mlp_angle")
+    save_dir = os.path.join(current_dir, "data", "tactile_data_mlp_v2")
     os.makedirs(save_dir, exist_ok=True)
     
     # 加载 ppmm
@@ -409,36 +513,21 @@ def main():
     
     # 初始化组件
     camera = TactileCamera(camera_config)
-    processor = MLPProcessor(ppmm=PPMM)
+    processor = MLPProcessorV2(ppmm=PPMM)
     visualizer = TactileVisualizer(
         windows=['original', 'depth', 'normal', 'gradient', 'marker'],
         window_size=(640, 480)
     )
     
-    # 初始化 marker 追踪器
+    # 初始化marker tracker
     marker_tracker = GelSightMarkerTracker()
-    marker_tracker_initialized = False
-    
-    # 连续采集数据缓冲
-    depth_buffer = []       # 存储深度数据
-    normal_buffer = []      # 存储法向量数据
-    marker_buffer = []      # 存储 marker 位移数据
-    
-    # 按键状态（用于在PyVista和OpenCV之间共享）
-    key_pressed = {'key': -1}
-    
-    def on_key_press(key):
-        """PyVista 键盘回调"""
-        key_pressed['key'] = ord(key) if isinstance(key, str) and len(key) == 1 else -1
+    marker_tracker.IsDisplay = False  # 我们自己控制显示
+    marker_initialized = False
     
     # 初始化3D可视化
     plotter = pv.Plotter(window_size=(800, 600), title="3D Depth")
     plotter.set_background('white')
     plotter.add_axes()
-    plotter.add_key_event('r', lambda: on_key_press('r'))
-    plotter.add_key_event('m', lambda: on_key_press('m'))
-    plotter.add_key_event('c', lambda: on_key_press('c'))
-    plotter.add_key_event('q', lambda: on_key_press('q'))
     plotter.show(interactive_update=True, auto_close=False)
     
     if processor.reconstructor is None:
@@ -448,15 +537,13 @@ def main():
     try:
         camera.connect()
         print("[INFO] 相机已连接")
-        print("\n=== 触觉传感器测试 (MLP Angle) ===")
-        print("操作说明（请确保 OpenCV 窗口有焦点）:")
+        print("\n=== 触觉传感器测试 (MLP v2 - 与gs_sdk一致) ===")
+        print("操作说明:")
         print("  r - 重置背景帧和marker追踪器")
         print("  m - 重置marker初始位置")
-        print("  c - 开始/停止连续采集（自动保存）")
+        print("  s - 保存当前数据")
         print("  q - 退出")
         print("=" * 50)
-        
-        is_collecting = False  # 是否正在连续采集
         
         while True:
             try:
@@ -473,69 +560,28 @@ def main():
                 visualizer.show('normal', normal_colored)
                 visualizer.show('gradient', grad_colored)
                 
-                # === Marker 追踪与可视化 ===
-                if not processor.con_flag:  # 背景已采集完成
-                    if not marker_tracker_initialized:
-                        # 初始化 marker 追踪器，使用背景帧
+                # 更新marker追踪并可视化位移
+                if not processor.con_flag:
+                    if not marker_initialized:
+                        # 使用背景帧初始化marker tracker
                         bg_frame = processor.reconstructor.bg_image
                         marker_tracker.reinit(bg_frame)
-                        marker_tracker_initialized = True
-                        print(f"[INFO] Marker追踪器已初始化, 检测到 {marker_tracker.MarkerCount} 个marker点")
+                        marker_initialized = True
+                        print(f"[INFO] Marker追踪器已初始化，检测到 {marker_tracker.MarkerCount} 个标记点")
                     else:
-                        # 更新 marker 运动
+                        # 更新marker运动
                         marker_tracker.update_markerMotion(warped_frame)
-                        
-                        # 获取位移数据
-                        displacements = marker_tracker.get_marker_displacements()
-                        
-                        # 可视化 marker 位移
-                        marker_vis = warped_frame.copy()
-                        if marker_tracker.flowcenter is not None and len(marker_tracker.flowcenter) > 0:
-                            for i in range(marker_tracker.MarkerCount):
-                                if i < len(marker_tracker.markerU):
-                                    cx = int(marker_tracker.flowcenter[i, 0])
-                                    cy = int(marker_tracker.flowcenter[i, 1])
-                                    dx = marker_tracker.markerU[i]
-                                    dy = marker_tracker.markerV[i]
-                                    
-                                    # 画原始位置（绿色圆点）
-                                    cv2.circle(marker_vis, (cx, cy), 3, (0, 255, 0), -1)
-                                    
-                                    # 画位移箭头（黄色）
-                                    if abs(dx) > 0.5 or abs(dy) > 0.5:
-                                        scale = 5  # 放大显示位移
-                                        end_x = int(cx + dx * scale)
-                                        end_y = int(cy + dy * scale)
-                                        cv2.arrowedLine(marker_vis, (cx, cy), (end_x, end_y), 
-                                                       (0, 255, 255), 2, tipLength=0.3)
-                        
-                        visualizer.show('marker', marker_vis)
-                        
-                        # 连续采集数据
-                        if is_collecting:
-                            # 采集深度
-                            if raw_depth is not None:
-                                depth_buffer.append(raw_depth.copy())
-                            # 采集法向量（从梯度计算）
-                            if G is not None:
-                                # 计算法向量 n = (-gx, -gy, 1) / |n|
-                                gx, gy = G[:, :, 0], G[:, :, 1]
-                                gz = np.ones_like(gx)
-                                magnitude = np.sqrt(gx**2 + gy**2 + gz**2)
-                                magnitude[magnitude == 0] = 1
-                                normals = np.stack([-gx/magnitude, -gy/magnitude, gz/magnitude], axis=-1)
-                                normal_buffer.append(normals.astype(np.float32))
-                            # 采集marker位移
-                            if displacements is not None:
-                                marker_buffer.append({
-                                    'displacements': displacements.copy(),
-                                    'positions': marker_tracker.flowcenter.copy() if marker_tracker.flowcenter is not None else None
-                                })
+                    
+                    # 可视化marker位移
+                    marker_vis = visualize_marker_displacement(
+                        warped_frame, marker_tracker, show_scale=4
+                    )
+                    visualizer.show('marker', marker_vis)
                 else:
                     # 背景采集中，显示空白
                     visualizer.show('marker', np.zeros_like(warped_frame))
                 
-                # === 3D 深度可视化 ===
+                # 更新3D可视化
                 if raw_depth is not None and not processor.con_flag:
                     h, w = raw_depth.shape
                     step = 4
@@ -544,7 +590,7 @@ def main():
                     
                     depth_range = depth_ds.max() - depth_ds.min()
                     if depth_range > 0.01:
-                        # 反转深度：按压越深 -> 3D中显示越高
+                        # 反转深度：按压越深（值越小）-> 3D中显示越高
                         depth_norm = (depth_ds.max() - depth_ds) / depth_range
                     else:
                         depth_norm = np.zeros_like(depth_ds)
@@ -560,64 +606,23 @@ def main():
                     plotter.add_mesh(grid, scalars="depth", cmap='viridis', show_scalar_bar=True)
                     plotter.update()
                 
-                # 检查按键（同时支持 OpenCV 窗口和 PyVista 窗口）
                 key = visualizer.wait_key(1)
-                # 如果 PyVista 窗口有按键，优先使用
-                if key_pressed['key'] != -1:
-                    key = key_pressed['key']
-                    key_pressed['key'] = -1  # 重置
-                
                 if key == ord('q'):
                     break
                 elif key == ord('r'):
                     processor.reset()
-                    marker_tracker_initialized = False
-                    depth_buffer = []
-                    normal_buffer = []
-                    marker_buffer = []
-                    print("[INFO] 处理器已重置，Marker追踪器将重新初始化")
-                elif key == ord('m') and marker_tracker_initialized:
-                    marker_tracker.iniMarkerPos()
-                    print("[INFO] Marker初始位置已重置")
-                elif key == ord('c'):
-                    is_collecting = not is_collecting
-                    if is_collecting:
-                        # 开始新的采集，清空缓冲
-                        depth_buffer = []
-                        normal_buffer = []
-                        marker_buffer = []
-                        print("[INFO] 开始采集数据...")
-                    else:
-                        # 停止采集，自动保存
-                        frame_count = len(depth_buffer)
-                        if frame_count > 0:
-                            timestamp = int(cv2.getTickCount())
-                            
-                            # 保存深度数据
-                            depth_file = os.path.join(save_dir, f"depth_{timestamp}.npy")
-                            np.save(depth_file, np.array(depth_buffer))
-                            print(f"[INFO] 深度数据已保存: {depth_file} ({frame_count} 帧)")
-                            
-                            # 保存法向量数据
-                            if len(normal_buffer) > 0:
-                                normal_file = os.path.join(save_dir, f"normal_{timestamp}.npy")
-                                np.save(normal_file, np.array(normal_buffer))
-                                print(f"[INFO] 法向量数据已保存: {normal_file} ({len(normal_buffer)} 帧)")
-                            
-                            # 保存marker数据
-                            if len(marker_buffer) > 0:
-                                marker_file = os.path.join(save_dir, f"marker_{timestamp}.npz")
-                                np.savez(marker_file, 
-                                        data=marker_buffer,
-                                        marker_count=marker_tracker.MarkerCount if marker_tracker_initialized else 0)
-                                print(f"[INFO] Marker数据已保存: {marker_file} ({len(marker_buffer)} 帧)")
-                            
-                            # 清空缓冲
-                            depth_buffer = []
-                            normal_buffer = []
-                            marker_buffer = []
-                        else:
-                            print("[INFO] 停止采集，无数据保存")
+                    marker_initialized = False
+                    print("[INFO] Marker追踪器将重新初始化")
+                elif key == ord('m'):
+                    if marker_initialized:
+                        marker_tracker.iniMarkerPos()
+                        print("[INFO] Marker位置已重置为当前位置")
+                elif key == ord('s') and raw_depth is not None:
+                    timestamp = int(cv2.getTickCount())
+                    np.save(os.path.join(save_dir, f"depth_{timestamp}.npy"), raw_depth)
+                    if G is not None:
+                        np.save(os.path.join(save_dir, f"gradient_{timestamp}.npy"), G)
+                    print(f"[INFO] 数据已保存: depth_{timestamp}.npy")
                 
             except TimeoutError:
                 continue
@@ -632,8 +637,6 @@ def main():
         plotter.close()
         visualizer.cleanup()
         camera.disconnect()
-        if marker_tracker_initialized:
-            marker_tracker.cleanup()
         print("[INFO] 相机已断开")
 
 

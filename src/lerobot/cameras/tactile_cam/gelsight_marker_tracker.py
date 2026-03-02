@@ -2,12 +2,18 @@
 import numpy as np
 import cv2
 
-
 class GelSightMarkerTracker:
     """GelSight 标记点追踪器"""
     
-    def __init__(self):
-        """初始化标记点追踪器"""
+    def __init__(self, node=None):
+        """
+        初始化标记点追踪器
+        
+        Args:
+            node: ROS2 节点对象（在非ROS2环境中设为None）
+        """
+        self.node = node  
+        self.bridge = None
         self.contactmap = np.zeros([480, 640])
 
         # 标记点相关参数
@@ -32,10 +38,6 @@ class GelSightMarkerTracker:
         self.touchMarkerMovThresh = 1
         self.touchMarkerNumThresh = 20
         
-        # marker检测阈值（差分值，负数）
-        # 越负越严格：-50只检测非常深的marker，-15检测浅色marker
-        self.marker_threshold = -30
-        
         # 窗口名称
         self.window_name = 'Marker Motion'
 
@@ -58,8 +60,8 @@ class GelSightMarkerTracker:
         # 初始化接触检测参数
         self._ini_contactDetect()
         
-        # 查找标记点（开启调试打印）
-        self.flowcenter = self.find_markers(debug=True)
+        # 查找标记点
+        self.flowcenter = self.find_markers()  # 所有标记点的中心坐标
         self.marker_last = self.flowcenter.copy()
         self.MarkerCount = len(self.flowcenter)
         self.markerU = np.zeros(self.MarkerCount)  # X方向运动
@@ -68,29 +70,39 @@ class GelSightMarkerTracker:
         # 创建显示窗口
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
 
-    def _loc_markerArea(self):
-        """
-        定位标记点区域（利用大核高斯模糊检测局部深色点）
-        
-        原理：
-        1. 对当前帧做大核高斯模糊，深色marker点被周围亮色"稀释"
-        2. 当前帧 - 模糊帧：marker区域出现强负值，背景接近0
-        3. 阈值筛选负值区域得到marker掩膜
-        """
-        if self.img is None:
+    # def _loc_markerArea(self):
+    #     """定位标记点区域（适用于Bnz GelSight）"""
+    #     if self.img is None or self.f0 is None:
+    #         return
+            
+    #     I = self.img.astype(np.double) - self.f0
+    #     self.MarkerMask = np.amax(I, 2) < -2
+
+
+    def _loc_markerArea(self, thresh=30, mode="dark"):
+        if self.img is None or self.f0 is None:
+            self.MarkerMask = None
             return
-        
-        # 大核高斯模糊（101x101核会充分稀释小的深色点）
-        blurred = cv2.GaussianBlur(self.img, (101, 101), 50)
-        
-        # 当前帧与模糊帧做差
-        I = self.img.astype(np.double) - blurred.astype(np.double)
-        
-        # 取三通道最大值（marker是深色，所有通道都会变暗）
-        max_diff = np.amax(I, 2)
-        
-        # 差分值小于阈值的像素被认为是marker
-        self.MarkerMask = max_diff < self.marker_threshold
+
+        I = self.img.astype(np.float32) - self.f0.astype(np.float32)
+        diff_max = np.max(I, axis=2)
+
+        if mode == "dark":      # marker 比背景暗
+            mask = diff_max < -thresh
+        else:                   # marker 比背景亮
+            mask = diff_max > thresh
+
+        mask = mask.astype(np.uint8)
+
+        # === 关键：形态学开闭去噪 ===
+        # 小的孤立点直接干掉
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        # 填一下小孔，避免 marker 被吃断
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        self.MarkerMask = mask.astype(bool)
+
 
     def displayIm(self):
         """显示标记点运动图像"""
@@ -114,14 +126,14 @@ class GelSightMarkerTracker:
         cv2.imshow(self.window_name, disIm)
         cv2.waitKey(1)
 
-    def find_markers(self, debug=False):
+    def find_markers(self):
         """查找标记点"""
         if self.img is None:
             return np.empty([0, 3])
             
         self._loc_markerArea()
-        areaThresh1 = 5
-        areaThresh2 = 500
+        areaThresh1 = 50
+        areaThresh2 = 400
         MarkerCenter = np.empty([0, 3])
 
         contours = cv2.findContours(self.MarkerMask.astype(np.uint8), 
@@ -133,13 +145,8 @@ class GelSightMarkerTracker:
             contours = contours[1]
         else:
             contours = contours[0]
-        
-        # 调试：打印轮廓信息
-        if debug and len(contours) > 0:
-            areas = [cv2.contourArea(c) for c in contours]
-            print(f"[DEBUG] 总轮廓数: {len(contours)}, 面积范围: {min(areas):.1f} ~ {max(areas):.1f}")
             
-        if len(contours) < 5:  # 标记点太少则放弃（改为5）
+        if len(contours) < 25:  # 标记点太少则放弃
             self.MarkerAvailable = False
             return MarkerCenter
 
@@ -210,6 +217,11 @@ class GelSightMarkerTracker:
         
         if self.IsDisplay:
             self.displayIm()
+        
+        disp = np.sqrt(self.markerU**2 + self.markerV**2)
+        small_motion_mask = disp < 0.5   # 阈值：0.5 px 小抖动全部忽略
+        self.markerU[small_motion_mask] = 0
+        self.markerV[small_motion_mask] = 0
 
     def get_marker_displacements(self):
         """

@@ -7,7 +7,7 @@ from lerobot.cameras.tactile_cam.tactile_config import TactileCameraConfig
 from lerobot.cameras.configs import ColorMode, Cv2Rotation
 
 class CalibrationImageCapture:
-    """捕获并矫正标定图像的类"""
+    """捕获并矫正标定图像的类（仅保存矫正后图像）"""
     
     def __init__(self, camera_config):
         """
@@ -18,7 +18,8 @@ class CalibrationImageCapture:
         """
         self.camera_config = camera_config
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        self.save_dir = os.path.join(current_dir, "data", "test_data")
+        self.save_dir1 = os.path.join(current_dir, "data", "test_data")
+        self.save_dir2 = os.path.join(current_dir, "data", "calibration_data")
         self.camera = None
         self.homography_matrix = None
         self.output_size = None     
@@ -30,31 +31,47 @@ class CalibrationImageCapture:
         self.camera.connect()
         print("[INFO] 相机连接成功")
 
-    def process_and_save_image(self, image, save_name, save_dir=None):
+    def process_and_save_image1(self, image, save_name):
         """
         基于预加载的透视矩阵矫正图像并保存
-        
         Args:
             image: 输入BGR图像
             save_name: 保存的基础文件名
-            save_dir: 保存目录（默认使用 self.save_dir）
         """
         if self.homography_matrix is None:
             print(f'[WARNING] {save_name}: 透视变换矩阵未加载，跳过保存')
             return
         
-        if save_dir is None:
-            save_dir = self.save_dir
-        os.makedirs(save_dir, exist_ok=True)
+        warped_img = cv2.warpPerspective(
+            image, 
+            self.homography_matrix, 
+            self.output_size,  # 使用标定时的输出尺寸
+            flags=cv2.INTER_NEAREST  # 最近邻，不改变像素值
+        )
+
+        save_path = os.path.join(self.save_dir1, f"{save_name}.jpg")
+        cv2.imwrite(save_path, warped_img)
+        print(f'[INFO] 已保存矫正后图像: {save_path}')
+
+    def process_and_save_image2(self, image, save_name):
+        """
+        基于预加载的透视矩阵矫正图像并保存
+        Args:
+            image: 输入BGR图像
+            save_name: 保存的基础文件名
+        """
+        if self.homography_matrix is None:
+            print(f'[WARNING] {save_name}: 透视变换矩阵未加载，跳过保存')
+            return
         
         warped_img = cv2.warpPerspective(
             image, 
             self.homography_matrix, 
-            self.output_size,
-            flags=cv2.INTER_NEAREST
+            self.output_size,  # 使用标定时的输出尺寸
+            flags=cv2.INTER_NEAREST  # 最近邻，不改变像素值
         )
 
-        save_path = os.path.join(save_dir, f"{save_name}.jpg")
+        save_path = os.path.join(self.save_dir2, f"{save_name}.jpg")
         cv2.imwrite(save_path, warped_img)
         print(f'[INFO] 已保存矫正后图像: {save_path}')
     
@@ -104,14 +121,22 @@ class CalibrationImageCapture:
                 
                 if key == ord(' '):
                     if count == 0:
-                        self.process_and_save_image(frame_bgr, 'ref')
+                        self.process_and_save_image1(frame_bgr, 'ref')
                         count += 1
                     elif count <= num_images:
-                        self.process_and_save_image(frame_bgr, f'sample_{count}')
+                        self.process_and_save_image1(frame_bgr, f'sample_{count}')
                         count += 1
                     if count > num_images:
                         print(f'[INFO] 已完成 {num_images} 张标定图像的捕获与矫正')
                         break
+                    
+                # elif key == ord('c'):
+                #     if count <= num_images:
+                #         self.process_and_save_image2(frame_bgr, f'calibration_{count}')
+                #         count += 1
+                #     if count > num_images:
+                #         print(f'[INFO] 已完成 {num_images} 张标定图像的捕获与矫正')
+                #         break
 
                 elif key == ord('q'):
                     print('[INFO] 用户取消捕获')

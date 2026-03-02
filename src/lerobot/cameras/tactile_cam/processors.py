@@ -1,10 +1,9 @@
 """
 触觉传感器图像处理器模块
 
-提供三种方法计算法向量和深度：
+提供两种方法计算法向量和深度：
 1. LookupTableProcessor: 基于查找表的方法（适用于校准过的传感器）
 2. GradientProcessor: 基于梯度的方法（通用方法）
-3. MLPProcessor: 基于神经网络的方法（需要训练模型）
 """
 
 import numpy as np
@@ -36,7 +35,7 @@ class BaseProcessor:
         
         if calib_file is None:
             current_dir = os.path.dirname(os.path.abspath(__file__))
-            calib_file = os.path.join(current_dir, "calibration_data", "homography_matrix.npz")
+            calib_file = os.path.join(current_dir, "calibration_data", "homography_matrix_320x240.npz")
         self.calib_file = calib_file
         
         self._load_homography()
@@ -518,40 +517,120 @@ class GradientProcessor(BaseProcessor):
 
 
 # ============================================================================
-# MLPProcessor: 基于神经网络的方法
+# MLPProcessor: 基于神经网络的方法 (与gs_sdk/6_3_test_mlp_v2.py一致)
 # ============================================================================
+
+class BGRXYMLPNet:
+    """与gs_sdk一致的MLP网络结构 (纯torch模块)"""
+    pass  # 在_load_model中动态创建
+
+
+def _image2bgrxys(image: np.ndarray) -> np.ndarray:
+    """将BGR图像转换为BGRXY特征 (与gs_sdk一致)"""
+    h, w = image.shape[:2]
+    ys = np.linspace(0, 1, h, endpoint=False, dtype=np.float32)
+    xs = np.linspace(0, 1, w, endpoint=False, dtype=np.float32)
+    xx, yy = np.meshgrid(xs, ys, indexing="xy")
+    bgrxys = np.concatenate(
+        [image.astype(np.float32) / 255.0, xx[..., np.newaxis], yy[..., np.newaxis]],
+        axis=2,
+    )
+    return bgrxys
+
+
+def _poisson_dct_neumann(gx: np.ndarray, gy: np.ndarray) -> np.ndarray:
+    """
+    使用DCT的泊松求解器 (与gs_sdk一致)
+    """
+    # 计算拉普拉斯算子
+    gxx = 1 * (
+        gx[:, (list(range(1, gx.shape[1])) + [gx.shape[1] - 1])]
+        - gx[:, ([0] + list(range(gx.shape[1] - 1)))]
+    )
+    gyy = 1 * (
+        gy[(list(range(1, gx.shape[0])) + [gx.shape[0] - 1]), :]
+        - gy[([0] + list(range(gx.shape[0] - 1))), :]
+    )
+    f = gxx + gyy
+
+    # 边界条件
+    b = np.zeros(gx.shape)
+    b[0, 1:-2] = -gy[0, 1:-2]
+    b[-1, 1:-2] = gy[-1, 1:-2]
+    b[1:-2, 0] = -gx[1:-2, 0]
+    b[1:-2, -1] = gx[1:-2, -1]
+    b[0, 0] = (1 / np.sqrt(2)) * (-gy[0, 0] - gx[0, 0])
+    b[0, -1] = (1 / np.sqrt(2)) * (-gy[0, -1] + gx[0, -1])
+    b[-1, -1] = (1 / np.sqrt(2)) * (gy[-1, -1] + gx[-1, -1])
+    b[-1, 0] = (1 / np.sqrt(2)) * (gy[-1, 0] - gx[-1, 0])
+
+    # 边界修正
+    f[0, 1:-2] = f[0, 1:-2] - b[0, 1:-2]
+    f[-1, 1:-2] = f[-1, 1:-2] - b[-1, 1:-2]
+    f[1:-2, 0] = f[1:-2, 0] - b[1:-2, 0]
+    f[1:-2, -1] = f[1:-2, -1] - b[1:-2, -1]
+
+    # 角落修正
+    f[0, -1] = f[0, -1] - np.sqrt(2) * b[0, -1]
+    f[-1, -1] = f[-1, -1] - np.sqrt(2) * b[-1, -1]
+    f[-1, 0] = f[-1, 0] - np.sqrt(2) * b[-1, 0]
+    f[0, 0] = f[0, 0] - np.sqrt(2) * b[0, 0]
+
+    # DCT变换
+    tt = scipy.fftpack.dct(f, norm="ortho")
+    fcos = scipy.fftpack.dct(tt.T, norm="ortho").T
+
+    # 频域求解
+    (x, y) = np.meshgrid(range(1, f.shape[1] + 1), range(1, f.shape[0] + 1), copy=True)
+    denom = 4 * (
+        (np.sin(0.5 * math.pi * x / (f.shape[1]))) ** 2
+        + (np.sin(0.5 * math.pi * y / (f.shape[0]))) ** 2
+    ).astype(np.float32)
+    denom[denom == 0] = 1  # 避免除零
+
+    # 逆DCT变换
+    f = -fcos / denom
+    tt = scipy.fftpack.idct(f, norm="ortho")
+    img_tt = scipy.fftpack.idct(tt.T, norm="ortho").T
+    img_tt = img_tt - img_tt.mean()
+
+    return img_tt
+
 
 class MLPProcessor(BaseProcessor):
     """
-    基于MLP神经网络的触觉图像处理器
+    基于MLP神经网络的触觉图像处理器 (与gs_sdk/6_3_test_mlp_v2.py一致)
     
-    使用训练好的神经网络将颜色映射到梯度，
-    然后通过泊松方程重建深度。
-    
-    与查找表方法相比，MLP方法可以学习更复杂的映射关系。
+    流程:
+    1. 加载背景图，计算背景梯度
+    2. 计算当前帧梯度，减去背景梯度得到差分梯度
+    3. 使用泊松方程重建深度
     """
     
     def __init__(self, model_path: str = None, pad: int = 20, 
-                 calib_file: str = None, device: str = None, has_marker: bool = False):
+                 calib_file: str = None, device: str = None, ppmm: float = 7.6):
         """
         初始化处理器
         
         Args:
-            model_path: MLP模型文件路径
+            model_path: MLP模型文件路径 (默认: load/nnmodel_v2.pth)
             pad: 边缘裁剪像素数
             calib_file: 透视变换矩阵文件路径
             device: 计算设备 ('cuda' 或 'cpu')
-            has_marker: 是否有标记点，False则不进行marker检测
+            ppmm: 像素每毫米
         """
         super().__init__(pad=pad, calib_file=calib_file)
         
-        # 是否有marker
-        self.has_marker = has_marker
+        self.ppmm = ppmm
         
-        # 延迟导入torch（避免不需要时的依赖）
+        # 延迟导入torch
         try:
             import torch
+            import torch.nn as nn
+            import torch.nn.functional as F
             self.torch = torch
+            self.nn = nn
+            self.F = F
         except ImportError:
             print("[ERROR] 需要安装 PyTorch: pip install torch")
             self.torch = None
@@ -564,50 +643,54 @@ class MLPProcessor(BaseProcessor):
         else:
             self.device = device
         
-        # 加载模型
+        # 模型路径 - 默认使用 nnmodel_v2.pth (与6_3_test_mlp_v2.py一致)
         if model_path is None:
             current_dir = os.path.dirname(os.path.abspath(__file__))
-            model_path = os.path.join(current_dir, "load", "mlp_gradient_model.pt")
+            model_path = os.path.join(current_dir, "load", "nnmodel_v2.pth")
         
         self.model_path = model_path
         self.model = None
-        self.norm_params = None
         self._load_model()
         
-        # 参考帧
-        self.ref_frame = None
-        self.ref_blur = None
+        # 背景帧和背景梯度
+        self.bg_image = None
+        self.bg_G = None
         
-        # 标记点掩膜阈值
-        self.marker_threshold = 60
+        # 多帧平均采集背景
+        self.ref_frames_buffer = []
+        self.ref_avg_count = 10
     
     def _load_model(self):
-        """加载MLP模型"""
+        """加载MLP模型 (BGRXYMLPNet架构)"""
         if self.torch is None:
             return
-            
+        
         try:
-            from .model import MLPGradientEncoder
+            # 动态创建BGRXYMLPNet
+            class BGRXYMLPNet(self.nn.Module):
+                def __init__(inner_self):
+                    super().__init__()
+                    input_size = 5
+                    inner_self.fc1 = self.nn.Linear(input_size, 128)
+                    inner_self.fc2 = self.nn.Linear(128, 32)
+                    inner_self.fc3 = self.nn.Linear(32, 32)
+                    inner_self.fc4 = self.nn.Linear(32, 2)
+
+                def forward(inner_self, x):
+                    x = self.F.relu(inner_self.fc1(x))
+                    x = self.F.relu(inner_self.fc2(x))
+                    x = self.F.relu(inner_self.fc3(x))
+                    x = inner_self.fc4(x)
+                    return x
             
-            # 加载归一化参数
-            norm_path = self.model_path.replace('.pt', '_norm.npz')
-            if os.path.exists(norm_path):
-                self.norm_params = dict(np.load(norm_path))
-                input_dim = int(self.norm_params.get('input_dim', 5))
-                hidden_dim = int(self.norm_params.get('hidden_dim', 32))
-            else:
-                input_dim = 5
-                hidden_dim = 32
-            
-            # 加载模型
-            self.model = MLPGradientEncoder(input_dim=input_dim, hidden_dim=hidden_dim)
+            self.model = BGRXYMLPNet()
             state_dict = self.torch.load(self.model_path, map_location=self.device)
             self.model.load_state_dict(state_dict)
             self.model.eval()
             self.model.to(self.device)
             
             print(f"[INFO] MLP模型已加载: {self.model_path}")
-            print(f"[INFO] 输入维度: {input_dim}, 隐藏层: {hidden_dim}, 设备: {self.device}")
+            print(f"[INFO] 设备: {self.device}")
             
         except FileNotFoundError:
             print(f"[WARNING] 模型文件不存在: {self.model_path}")
@@ -616,80 +699,68 @@ class MLPProcessor(BaseProcessor):
             print(f"[WARNING] 加载MLP模型失败: {e}")
             self.model = None
     
-    def _get_marker_mask(self, image: np.ndarray) -> np.ndarray:
-        """获取标记点掩膜"""
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        mask = (gray < self.marker_threshold).astype(np.uint8)
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.dilate(mask, kernel, iterations=1)
-        return mask
-    
-    def _infer_gradient(self, image: np.ndarray, ref_image: np.ndarray) -> tuple:
-        """使用MLP推理梯度"""
+    def _compute_gradient(self, image: np.ndarray) -> np.ndarray:
+        """使用MLP计算图像的梯度"""
         if self.model is None or self.torch is None:
-            return None, None
+            return np.zeros((image.shape[0], image.shape[1], 2), dtype=np.float32)
         
-        h, w = image.shape[:2]
-        
-        # 计算差值图像
-        diff = cv2.absdiff(image, ref_image)
-        diff_gray = np.max(diff, axis=2)
-        contact_mask = (diff_gray > 20).astype(np.uint8)
-        
-        # 根据是否有marker决定有效区域
-        if self.has_marker:
-            # 获取标记点掩膜
-            marker_mask = self._get_marker_mask(image)
-            ref_marker_mask = self._get_marker_mask(ref_image)
-            combined_mask = cv2.bitwise_or(marker_mask, ref_marker_mask)
-            # 有效区域 = 接触区域 - 标记点
-            valid_mask = contact_mask & (combined_mask == 0)
-        else:
-            # 没有marker时，接触区域即为有效区域
-            valid_mask = contact_mask
-        
-        y_coords, x_coords = np.where(valid_mask > 0)
-        
-        if len(x_coords) == 0:
-            return np.zeros((h, w)), np.zeros((h, w))
-        
-        # 准备输入特征
-        bgr_values = image[y_coords, x_coords].astype(np.float32) / 255.0
-        
-        if self.norm_params is not None and 'x_max' in self.norm_params:
-            x_norm = x_coords.astype(np.float32) / float(self.norm_params['x_max'])
-            y_norm = y_coords.astype(np.float32) / float(self.norm_params['y_max'])
-        else:
-            x_norm = x_coords.astype(np.float32) / w
-            y_norm = y_coords.astype(np.float32) / h
-        
-        features = np.column_stack([
-            bgr_values[:, 0], bgr_values[:, 1], bgr_values[:, 2],
-            x_norm, y_norm
-        ])
-        
-        # 推理
-        features_tensor = self.torch.tensor(features, dtype=self.torch.float32).to(self.device)
+        bgrxys = _image2bgrxys(image).reshape(-1, 5)
+        features = self.torch.from_numpy(bgrxys).float().to(self.device)
         
         with self.torch.no_grad():
-            gradients = self.model(features_tensor)
-            gradients = gradients.cpu().numpy()
+            gxyangles = self.model(features)
+            gxyangles = gxyangles.cpu().numpy()
+            # 将梯度角度转换为梯度值
+            G = np.tan(gxyangles.reshape(image.shape[0], image.shape[1], 2))
         
-        # 重建梯度图
-        gx = np.zeros((h, w), dtype=np.float32)
-        gy = np.zeros((h, w), dtype=np.float32)
-        gx[y_coords, x_coords] = gradients[:, 0]
-        gy[y_coords, x_coords] = gradients[:, 1]
-        
-        return gx, gy
+        return G
     
-    def _compute_normals(self, gx: np.ndarray, gy: np.ndarray) -> np.ndarray:
+    def load_bg(self, bg_image: np.ndarray):
+        """加载背景图像并计算背景梯度"""
+        self.bg_image = bg_image.copy()
+        self.bg_G = self._compute_gradient(bg_image)
+        print(f"[INFO] 背景图像已加载，尺寸: {bg_image.shape[:2]}")
+    
+    def _compute_normals(self, G: np.ndarray) -> np.ndarray:
         """从梯度计算法向量"""
+        gx = G[:, :, 0]
+        gy = G[:, :, 1]
         gz = np.ones_like(gx)
+        
         magnitude = np.sqrt(gx**2 + gy**2 + gz**2)
         magnitude[magnitude == 0] = 1
-        normals = np.stack([gx/magnitude, gy/magnitude, gz/magnitude], axis=-1)
-        return normals
+        
+        nx = -gx / magnitude
+        ny = -gy / magnitude
+        nz = gz / magnitude
+        
+        return np.stack([nx, ny, nz], axis=-1)
+    
+    def _colorize_depth(self, depth: np.ndarray) -> np.ndarray:
+        """深度图着色 - 按压越深颜色越亮"""
+        h, w = depth.shape
+        
+        depth_range = depth.max() - depth.min()
+        if depth_range < 0.01:
+            return np.full((h, w, 3), [128, 0, 68], dtype=np.uint8)
+        
+        # 反转深度：按压越深（值越小/越负）-> 显示越亮
+        depth_normalized = (depth.max() - depth) / depth_range
+        depth_normalized = np.clip(depth_normalized, 0, 1)
+        depth_uint8 = (depth_normalized * 255).astype(np.uint8)
+        return cv2.applyColorMap(depth_uint8, cv2.COLORMAP_VIRIDIS)
+    
+    def _colorize_normals(self, normals: np.ndarray) -> np.ndarray:
+        """法向量着色"""
+        # 映射到颜色 [-1, 1] -> [0, 255]
+        normals_normalized = (normals + 1) / 2
+        # BGR格式
+        normals_bgr = np.stack([
+            normals_normalized[:, :, 2],  # B <- nz
+            normals_normalized[:, :, 1],  # G <- ny
+            normals_normalized[:, :, 0],  # R <- nx
+        ], axis=-1)
+        return (normals_bgr * 255).astype(np.uint8)
     
     def process_frame(self, frame: np.ndarray, apply_warp: bool = False):
         """
@@ -710,43 +781,54 @@ class MLPProcessor(BaseProcessor):
         
         h, w = frame.shape[:2]
         
-        # 第一帧作为参考
+        if self.model is None:
+            return (np.zeros((h, w, 3), dtype=np.uint8),
+                    np.zeros((h, w, 3), dtype=np.uint8),
+                    np.zeros((h, w), dtype=np.float32),
+                    np.zeros((h, w, 3), dtype=np.float32))
+        
+        # 采集背景帧（多帧平均）
         if self.con_flag:
-            self.ref_frame = frame.copy()
-            self.ref_blur = cv2.GaussianBlur(frame.astype(np.float32), (3, 3), 0)
-            self.con_flag = False
-            return (np.zeros((h, w, 3), dtype=np.uint8),
-                    np.zeros((h, w, 3), dtype=np.uint8),
-                    np.zeros((h, w)),
-                    np.zeros((h, w, 3)))
+            self.ref_frames_buffer.append(frame.astype(np.float32))
+            
+            if len(self.ref_frames_buffer) < self.ref_avg_count:
+                return (np.zeros((h, w, 3), dtype=np.uint8),
+                        np.zeros((h, w, 3), dtype=np.uint8),
+                        np.zeros((h, w), dtype=np.float32),
+                        np.zeros((h, w, 3), dtype=np.float32))
+            else:
+                # 计算平均背景帧
+                bg_image = np.mean(self.ref_frames_buffer, axis=0).astype(np.uint8)
+                self.load_bg(bg_image)
+                self.con_flag = False
+                self.ref_frames_buffer = []
+                return (np.zeros((h, w, 3), dtype=np.uint8),
+                        np.zeros((h, w, 3), dtype=np.uint8),
+                        np.zeros((h, w), dtype=np.float32),
+                        np.zeros((h, w, 3), dtype=np.float32))
         
-        # 推理梯度
-        gx, gy = self._infer_gradient(frame, self.ref_frame)
+        # 计算当前帧梯度
+        G = self._compute_gradient(frame)
         
-        if gx is None:
-            return (np.zeros((h, w, 3), dtype=np.uint8),
-                    np.zeros((h, w, 3), dtype=np.uint8),
-                    np.zeros((h, w)),
-                    np.zeros((h, w, 3)))
+        # 减去背景梯度
+        G = G - self.bg_G
         
-        # 泊松重建
-        depth = fast_poisson(gx, gy)
+        # 泊松重建深度
+        depth = _poisson_dct_neumann(G[:, :, 0], G[:, :, 1]).astype(np.float32)
         
         # 计算法向量
-        normals = self._compute_normals(gx, gy)
+        normals = self._compute_normals(G)
         
         # 可视化
-        depth_norm = depth - depth.min()
-        if depth_norm.max() > 0:
-            depth_norm = depth_norm / depth_norm.max()
-        depth_colored = cv2.applyColorMap((depth_norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
-        
-        normal_colored = ((normals + 1) / 2 * 255).astype(np.uint8)
+        depth_colored = self._colorize_depth(depth)
+        normal_colored = self._colorize_normals(normals)
         
         return depth_colored, normal_colored, depth, normals
     
     def reset(self):
         """重置处理器状态"""
         super().reset()
-        self.ref_frame = None
-        self.ref_blur = None
+        self.bg_image = None
+        self.bg_G = None
+        self.ref_frames_buffer = []
+        print("[INFO] 处理器已重置，将采集多帧平均作为背景")

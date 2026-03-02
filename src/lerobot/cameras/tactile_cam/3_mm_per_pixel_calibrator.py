@@ -28,7 +28,7 @@ class MMPerPixelCalibrator:
         self.homography_matrix = None
         self.output_size = None
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        self.calib_file = os.path.join(current_dir, "calibration_data", "homography_matrix_320x240.npz")
+        self.calib_file = os.path.join(current_dir, "calibration_data", "homography_matrix.npz")
         self.result_file = os.path.join(current_dir, "calibration_data", "mm_per_pixel.npz")
         
         # 检测结果
@@ -211,112 +211,130 @@ class MMPerPixelCalibrator:
         print("\n=== mm/px 标定工具 ===")
         print(f"圆柱直径: {self.cylinder_diameter_mm} mm")
         print("\n操作说明:")
-        print("  1. 按 'r' 捕获参考图像（无按压状态）")
-        print("  2. 用10mm圆柱按压传感器")
-        print("  3. 按 空格 检测圆形并计算 mm/px")
-        print("  4. 按 's' 保存标定结果")
+        print("  1. 按 'c' 采集当前图像")
+        print("  2. 采集后使用 IJKL 移动圆心 (I上 K下 J左 L右)")
+        print("  3. 按 'm' 扩大半径, 'n' 缩小半径")
+        print("  4. 按 空格 保存标定结果")
         print("  5. 按 'q' 退出")
         print("========================\n")
         
-        ref_image = None
+        captured_image = None
         current_result = None
+        
+        # 手动调整变量
+        manual_center = None  # (x, y)
+        manual_radius = 50    # 默认半径
+        move_step = 1         # 移动步长
+        
+        cv2.namedWindow('mm/px Calibration')
         
         while True:
             try:
-                frame = self.camera.async_read(timeout_ms=200)
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                warped = self.apply_perspective(frame_bgr)
-                
-                # 显示图像
-                display = warped.copy()
-                
-                # 如果有检测结果，绘制
-                if current_result is not None:
-                    x, y, r, mm_px = current_result
-                    # 绘制检测到的圆
-                    cv2.circle(display, (x, y), r, (0, 255, 0), 2)
-                    cv2.circle(display, (x, y), 3, (0, 0, 255), -1)
-                    
-                    # 显示信息
-                    info_text = f"D={2*r}px, {self.cylinder_diameter_mm}mm"
-                    cv2.putText(display, info_text, (x - 60, y - r - 10),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                    
-                    mm_px_text = f"mm/px = {mm_px:.4f}"
-                    cv2.putText(display, mm_px_text, (10, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                    
-                    px_per_mm_text = f"px/mm = {1/mm_px:.2f}"
-                    cv2.putText(display, px_per_mm_text, (10, 60),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                
-                # 显示状态
-                if ref_image is not None:
-                    cv2.putText(display, "[REF OK]", (display.shape[1] - 80, 25),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                # 如果没有采集图像，显示实时画面
+                if captured_image is None:
+                    frame = self.camera.async_read(timeout_ms=200)
+                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    warped = self.apply_perspective(frame_bgr)
+                    display = warped.copy()
+                    cv2.putText(display, "[LIVE] Press 'c' to capture", (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                 else:
-                    cv2.putText(display, "[NO REF]", (display.shape[1] - 80, 25),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                    # 显示采集的静态图像
+                    display = captured_image.copy()
+                    
+                    # 绘制圆形
+                    if manual_center is not None:
+                        x, y = manual_center
+                        cv2.circle(display, (x, y), manual_radius, (0, 255, 0), 2)
+                        cv2.circle(display, (x, y), 3, (0, 0, 255), -1)
+                        
+                        # 绘制十字线辅助定位
+                        cv2.line(display, (x - 20, y), (x + 20, y), (255, 0, 0), 1)
+                        cv2.line(display, (x, y - 20), (x, y + 20), (255, 0, 0), 1)
+                        
+                        mm_px = self.calculate_mm_per_pixel(manual_radius)
+                        current_result = (x, y, manual_radius, mm_px)
+                        self.mm_per_pixel = mm_px
+                        
+                        # 显示信息
+                        info_text = f"D={2*manual_radius}px, {self.cylinder_diameter_mm}mm"
+                        cv2.putText(display, info_text, (x - 60, y - manual_radius - 10),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        
+                        mm_px_text = f"mm/px = {mm_px:.4f}"
+                        cv2.putText(display, mm_px_text, (10, 30),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                        
+                        px_per_mm_text = f"px/mm = {1/mm_px:.2f}"
+                        cv2.putText(display, px_per_mm_text, (10, 60),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    
+                    # 显示操作提示
+                    cv2.putText(display, "[CAPTURED] IJKL:move  M/N:radius  SPACE:save", 
+                               (10, display.shape[0] - 10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+                    cv2.putText(display, f"Center: {manual_center}  Radius: {manual_radius}px", 
+                               (10, display.shape[0] - 35),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
                 
                 cv2.imshow('mm/px Calibration', display)
                 
-                # 如果有参考图像，显示差分和边缘图
-                if ref_image is not None:
-                    diff = cv2.absdiff(warped, ref_image)
-                    cv2.imshow('Difference', diff)
-                    
-                    # 显示 Canny 边缘检测结果
-                    _, edges = self.detect_circle_canny(warped, ref_image)
-                    cv2.imshow('Canny Edges', edges)
-                    
-                    # 显示轮廓检测结果
-                    _, thresh = self.detect_circle_contour(warped, ref_image)
-                    cv2.imshow('Threshold', thresh)
-                
                 key = cv2.waitKey(1) & 0xFF
                 
-                if key == ord('r'):
-                    # 捕获参考图像
-                    ref_image = warped.copy()
-                    print("[INFO] 参考图像已捕获")
+                if key == ord('c'):
+                    # 采集当前图像
+                    frame = self.camera.async_read(timeout_ms=200)
+                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    captured_image = self.apply_perspective(frame_bgr)
+                    # 初始化圆心为图像中心
+                    h, w = captured_image.shape[:2]
+                    manual_center = (w // 2, h // 2)
+                    print(f"[INFO] 图像已采集，圆心初始化为图像中心: {manual_center}")
+                    print("[INFO] 使用 WASD 移动圆心，M/N 调整半径")
+                
+                elif key == ord('i') and captured_image is not None and manual_center is not None:
+                    # 向上移动
+                    x, y = manual_center
+                    manual_center = (x, max(0, y - move_step))
                     
-                elif key == ord(' '):
-                    # 先尝试 Canny + 霍夫圆
-                    circles, edges = self.detect_circle_canny(warped, ref_image)
-                    method = "Canny+Hough"
+                elif key == ord('k') and captured_image is not None and manual_center is not None:
+                    # 向下移动
+                    x, y = manual_center
+                    h = captured_image.shape[0]
+                    manual_center = (x, min(h - 1, y + move_step))
                     
-                    # 如果失败，尝试轮廓检测
-                    if circles is None:
-                        circles, _ = self.detect_circle_contour(warped, ref_image)
-                        method = "Contour"
+                elif key == ord('j') and captured_image is not None and manual_center is not None:
+                    # 向左移动
+                    x, y = manual_center
+                    manual_center = (max(0, x - move_step), y)
                     
-                    if circles is not None and len(circles) > 0:
-                        # 取最大的圆（假设是按压区域）
-                        largest = max(circles, key=lambda c: c[2])
-                        x, y, r = largest
-                        mm_px = self.calculate_mm_per_pixel(r)
-                        current_result = (x, y, r, mm_px)
-                        self.mm_per_pixel = mm_px
-                        
-                        print(f"\n[检测结果] 方法: {method}")
-                        print(f"  检测到 {len(circles)} 个圆")
-                        print(f"  最大圆: 圆心({x}, {y}), 半径={r}px")
-                        print(f"  直径: {2*r} px")
-                        print(f"  实际直径: {self.cylinder_diameter_mm} mm")
-                        print(f"  mm/px = {mm_px:.4f}")
-                        print(f"  px/mm = {1/mm_px:.2f}")
-                    else:
-                        print("[WARNING] 未检测到圆形")
-                        print("  提示: 1) 确保已按 'r' 捕获参考图像")
-                        print("        2) 增加按压力度")
-                        print("        3) 确保按压区域在图像中央")
-                        
-                elif key == ord('s'):
+                elif key == ord('l') and captured_image is not None and manual_center is not None:
+                    # 向右移动
+                    x, y = manual_center
+                    w = captured_image.shape[1]
+                    manual_center = (min(w - 1, x + move_step), y)
+                
+                elif key == ord('m') and captured_image is not None:
+                    # 扩大半径
+                    manual_radius += 1
+                    if manual_center is not None:
+                        mm_px = self.calculate_mm_per_pixel(manual_radius)
+                        print(f"[调整] 半径: {manual_radius}px, mm/px={mm_px:.4f}")
+                
+                elif key == ord('n') and captured_image is not None:
+                    # 缩小半径
+                    if manual_radius > 5:
+                        manual_radius -= 1
+                        if manual_center is not None:
+                            mm_px = self.calculate_mm_per_pixel(manual_radius)
+                            print(f"[调整] 半径: {manual_radius}px, mm/px={mm_px:.4f}")
+                
+                elif key == ord(' '):  # 空格保存
                     # 保存结果
                     if self.mm_per_pixel is not None:
                         self.save_calibration()
                     else:
-                        print("[WARNING] 请先检测圆形计算 mm/px")
+                        print("[WARNING] 请先采集图像并调整圆形")
                         
                 elif key == ord('q'):
                     break

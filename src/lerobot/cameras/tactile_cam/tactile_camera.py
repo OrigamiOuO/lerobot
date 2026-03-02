@@ -162,46 +162,85 @@ class TactileCamera(Camera):
         """使用 v4l2-ctl 设置曝光和白平衡."""
         device_path = self.index_or_path
         if isinstance(device_path, int):
-            device_path = f"{device_path}"
+            device_path = f"/dev/video{device_path}"
         
         try:
             # 1. 设置曝光
+            # 注意：必须先禁用自动曝光，才能设置手动曝光值
+            # auto_exposure: 1=手动(Manual Mode), 3=自动(Aperture Priority Mode)
             if self.auto_exposure:
-                subprocess.run(
+                result = subprocess.run(
                     ["v4l2-ctl", "-d", str(device_path), "-c", "auto_exposure=3"],
                     check=False, capture_output=True, timeout=5
                 )
-                logger.debug(f"{self} 自动曝光已启用")
+                if result.returncode == 0:
+                    logger.info(f"{self} 自动曝光已启用")
+                else:
+                    logger.warning(f"{self} 设置自动曝光失败: {result.stderr.decode()}")
             else:
-                # 禁用自动曝光 (auto_exposure: 1=手动, 3=自动)
-                subprocess.run(
+                # 先禁用自动曝光
+                result = subprocess.run(
                     ["v4l2-ctl", "-d", str(device_path), "-c", "auto_exposure=1"],
                     check=False, capture_output=True, timeout=5
                 )
-                # 设置曝光值
-                subprocess.run(
+                if result.returncode != 0:
+                    logger.warning(f"{self} 禁用自动曝光失败: {result.stderr.decode()}")
+                
+                # 然后设置曝光值
+                result = subprocess.run(
                     ["v4l2-ctl", "-d", str(device_path), "-c", f"exposure_time_absolute={int(self.exposure_value)}"],
                     check=False, capture_output=True, timeout=5
                 )
-                logger.debug(f"{self} 手动曝光: {self.exposure_value}")
+                if result.returncode == 0:
+                    logger.info(f"{self} 手动曝光设置为: {self.exposure_value}")
+                else:
+                    logger.warning(f"{self} 设置曝光值失败: {result.stderr.decode()}")
             
             # 2. 设置白平衡
+            # 注意：不同相机可能使用不同的控制名称
+            # 常见名称: white_balance_automatic, white_balance_temperature_auto
             if self.auto_wb:
-                subprocess.run(
-                    ["v4l2-ctl", "-d", str(device_path), "-c", "white_balance_temperature_auto=1"],
+                # 尝试两种可能的控制名称
+                result = subprocess.run(
+                    ["v4l2-ctl", "-d", str(device_path), "-c", "white_balance_automatic=1"],
                     check=False, capture_output=True, timeout=5
                 )
-                logger.debug(f"{self} 自动白平衡已启用")
+                if result.returncode != 0:
+                    # 尝试备选名称
+                    result = subprocess.run(
+                        ["v4l2-ctl", "-d", str(device_path), "-c", "white_balance_temperature_auto=1"],
+                        check=False, capture_output=True, timeout=5
+                    )
+                if result.returncode == 0:
+                    logger.info(f"{self} 自动白平衡已启用")
+                else:
+                    logger.warning(f"{self} 设置自动白平衡失败: {result.stderr.decode()}")
             else:
-                subprocess.run(
-                    ["v4l2-ctl", "-d", str(device_path), "-c", "white_balance_temperature_auto=0"],
+                # 先禁用自动白平衡 (尝试两种名称)
+                result = subprocess.run(
+                    ["v4l2-ctl", "-d", str(device_path), "-c", "white_balance_automatic=0"],
                     check=False, capture_output=True, timeout=5
                 )
-                subprocess.run(
+                if result.returncode != 0:
+                    result = subprocess.run(
+                        ["v4l2-ctl", "-d", str(device_path), "-c", "white_balance_temperature_auto=0"],
+                        check=False, capture_output=True, timeout=5
+                    )
+                if result.returncode != 0:
+                    logger.warning(f"{self} 禁用自动白平衡失败: {result.stderr.decode()}")
+                
+                # 然后设置白平衡温度
+                result = subprocess.run(
                     ["v4l2-ctl", "-d", str(device_path), "-c", f"white_balance_temperature={self.wb_temperature}"],
                     check=False, capture_output=True, timeout=5
                 )
-                logger.debug(f"{self} 手动白平衡: {self.wb_temperature}K")
+                if result.returncode == 0:
+                    logger.info(f"{self} 手动白平衡设置为: {self.wb_temperature}K")
+                else:
+                    logger.warning(f"{self} 设置白平衡温度失败: {result.stderr.decode()}")
+            
+            # 验证设置结果
+            self._verify_v4l2_settings(device_path)
                 
         except FileNotFoundError:
             logger.warning(f"{self} v4l2-ctl 未安装，请运行: sudo apt install v4l-utils")
@@ -209,6 +248,29 @@ class TactileCamera(Camera):
             logger.warning(f"{self} v4l2-ctl 超时")
         except Exception as e:
             logger.warning(f"{self} V4L2 相机参数设置失败: {e}")
+    
+    def _verify_v4l2_settings(self, device_path: str) -> None:
+        """验证 v4l2 设置是否生效."""
+        try:
+            result = subprocess.run(
+                ["v4l2-ctl", "-d", str(device_path), "--get-ctrl", 
+                 "auto_exposure,exposure_time_absolute,white_balance_automatic,white_balance_temperature"],
+                check=False, capture_output=True, timeout=5
+            )
+            if result.returncode == 0:
+                output = result.stdout.decode().strip()
+                logger.info(f"{self} 当前相机参数:\n{output}")
+            else:
+                # 某些控制可能不存在，尝试单独获取
+                for ctrl in ["auto_exposure", "exposure_time_absolute"]:
+                    result = subprocess.run(
+                        ["v4l2-ctl", "-d", str(device_path), "--get-ctrl", ctrl],
+                        check=False, capture_output=True, timeout=5
+                    )
+                    if result.returncode == 0:
+                        logger.info(f"{self} {result.stdout.decode().strip()}")
+        except Exception as e:
+            logger.debug(f"{self} 无法验证设置: {e}")
 
     def _validate_fps(self) -> None:
         """Validates and sets the camera's FPS (兼容驱动返回False)."""

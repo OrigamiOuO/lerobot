@@ -6,7 +6,6 @@
 
 import torch
 from torch import nn
-import torch.nn.functional as F
 
 
 class MLPGradientEncoder(nn.Module):
@@ -41,29 +40,6 @@ class MLPGradientEncoder(nn.Module):
 
     def forward(self, x):
         return self.encoder(x)
-
-
-class BGRXYMLPNet(nn.Module):
-    """
-    与gs_sdk一致的MLP网络结构
-    
-    输入: BGRXY (5维，归一化到[0,1])
-    输出: gxyangles (2维，梯度角度，弧度)
-    """
-    def __init__(self):
-        super(BGRXYMLPNet, self).__init__()
-        input_size = 5
-        self.fc1 = nn.Linear(input_size, 128)
-        self.fc2 = nn.Linear(128, 32)
-        self.fc3 = nn.Linear(32, 32)
-        self.fc4 = nn.Linear(32, 2)
-
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
-        x = self.fc4(x)
-        return x
 
 
 class MLPGradientEncoderLarge(nn.Module):

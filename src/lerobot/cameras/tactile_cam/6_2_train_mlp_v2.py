@@ -15,6 +15,7 @@ MLP模型训练脚本 (v2 - 与gs_sdk一致)
 """
 
 import os
+import sys
 import json
 import numpy as np
 import torch
@@ -24,7 +25,34 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 import matplotlib.pyplot as plt
 
-from lerobot.cameras.tactile_cam.model import BGRXYMLPNet
+# 确保可以导入 lerobot 模块
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+_src_dir = os.path.abspath(os.path.join(_current_dir, "..", "..", ".."))
+if _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
+
+
+class BGRXYMLPNet(nn.Module):
+    """
+    与gs_sdk一致的MLP网络结构
+    
+    输入: BGRXY (5维，归一化到[0,1])
+    输出: gxyangles (2维，梯度角度，弧度)
+    """
+    def __init__(self):
+        super(BGRXYMLPNet, self).__init__()
+        input_size = 5
+        self.fc1 = nn.Linear(input_size, 128)
+        self.fc2 = nn.Linear(128, 32)
+        self.fc3 = nn.Linear(32, 32)
+        self.fc4 = nn.Linear(32, 2)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        x = self.fc4(x)
+        return x
 
 
 class BGRXYDataset(Dataset):
@@ -60,7 +88,7 @@ def evaluate(net, dataloader, device):
 
 def train(dataset_path: str, model_save_dir: str,
           n_epochs: int = 200, batch_size: int = 1024,
-          learning_rate: float = 0.001, 
+          learning_rate: float = 0.002, 
           train_ratio: float = 0.8, device: str = None):
     """
     训练MLP模型 (与gs_sdk一致的训练流程)
@@ -230,8 +258,8 @@ def main():
     net, history = train(
         dataset_path=dataset_path,
         model_save_dir=model_save_dir,
-        n_epochs=200,
-        batch_size=1024,
+        n_epochs=100,
+        batch_size=2048,
         learning_rate=0.001,
         train_ratio=0.8,
         device=None

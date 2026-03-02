@@ -40,8 +40,12 @@ class SOFollowerConfig:
     # cameras
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
 
-    # Tactile camera configuration (optional)
+    # Tactile camera configuration (optional) - single camera for backward compatibility
     tactile_camera: TactileCameraConfig | None = None
+    
+    # Multiple tactile cameras configuration (optional)
+    # Example: {"left_finger": TactileCameraConfig(...), "right_finger": TactileCameraConfig(...)}
+    tactile_cameras: dict[str, TactileCameraConfig] = field(default_factory=dict)
     
     # Number of marker points for tactile sensor
     num_markers: int = 35

@@ -69,6 +69,9 @@ class SOLeader(Teleoperator):
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
         self.bus.connect()
+        # SAFETY: Immediately disable torque after connection to prevent unintended motion
+        self.bus.disable_torque()
+        
         if not self.is_calibrated and calibrate:
             logger.info(
                 "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
@@ -126,10 +129,13 @@ class SOLeader(Teleoperator):
         print(f"Calibration saved to {self.calibration_fpath}")
 
     def configure(self) -> None:
+        # SAFETY: Keep torque disabled for leader arm to prevent unintended motion during operation
         self.bus.disable_torque()
         self.bus.configure_motors()
         for motor in self.bus.motors:
             self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
+        # Ensure torque stays disabled after configuration
+        self.bus.disable_torque()
 
     def setup_motors(self) -> None:
         for motor in reversed(self.bus.motors):

@@ -20,6 +20,8 @@ import logging
 import math
 import os
 import platform
+import shutil
+import subprocess
 import time
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -128,6 +130,10 @@ class OpenCVCamera(Camera):
         self.rotation: int | None = get_cv2_rotation(config.rotation)
         self.backend: int = get_cv2_backend()
 
+        # Initialize capture dimensions
+        self.capture_width: int | None = None
+        self.capture_height: int | None = None
+        
         if self.height and self.width:
             self.capture_width, self.capture_height = self.width, self.height
             if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
@@ -160,6 +166,10 @@ class OpenCVCamera(Camera):
         # blocking in multi-threaded applications, especially during data collection.
         cv2.setNumThreads(1)
 
+        # On Linux, pre-configure camera resolution using v4l2-ctl before opening
+        # Some cameras don't respond to OpenCV's set() calls but work with v4l2-ctl
+        self._preconfigure_v4l2()
+
         self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
 
         if not self.videocapture.isOpened():
@@ -178,6 +188,62 @@ class OpenCVCamera(Camera):
                 time.sleep(0.1)
 
         logger.info(f"{self} connected.")
+
+    def _preconfigure_v4l2(self) -> None:
+        """
+        Pre-configure camera resolution using v4l2-ctl on Linux.
+        
+        Some cameras don't respond to OpenCV's VideoCapture.set() calls for resolution,
+        but they do respond to v4l2-ctl commands. This method uses v4l2-ctl to set
+        the resolution before opening the camera with OpenCV.
+        
+        This is a workaround for cameras with drivers that don't properly implement
+        the V4L2 ioctl calls through OpenCV.
+        """
+        # Only works on Linux with device paths
+        if platform.system() != "Linux":
+            return
+        
+        # Check if v4l2-ctl is available
+        if shutil.which("v4l2-ctl") is None:
+            logger.debug("v4l2-ctl not found, skipping pre-configuration")
+            return
+        
+        # Only use for device paths like /dev/video0, not for integer indices
+        device_path = self.index_or_path
+        if isinstance(device_path, int):
+            device_path = f"/dev/video{device_path}"
+        elif isinstance(device_path, Path):
+            device_path = str(device_path)
+        
+        if not isinstance(device_path, str) or not device_path.startswith("/dev/video"):
+            return
+        
+        # Build v4l2-ctl command
+        if self.capture_width is None or self.capture_height is None:
+            return
+        
+        # Determine pixel format
+        pixelformat = "MJPG"  # Default to MJPG for better compatibility
+        if self.config.fourcc:
+            pixelformat = self.config.fourcc
+        
+        cmd = [
+            "v4l2-ctl",
+            "-d", device_path,
+            f"--set-fmt-video=width={self.capture_width},height={self.capture_height},pixelformat={pixelformat}"
+        ]
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                logger.debug(f"Pre-configured {device_path} to {self.capture_width}x{self.capture_height} using v4l2-ctl")
+            else:
+                logger.debug(f"v4l2-ctl failed for {device_path}: {result.stderr}")
+        except subprocess.TimeoutExpired:
+            logger.debug(f"v4l2-ctl timed out for {device_path}")
+        except Exception as e:
+            logger.debug(f"v4l2-ctl error for {device_path}: {e}")
 
     def _configure_capture_settings(self) -> None:
         """
@@ -237,7 +303,9 @@ class OpenCVCamera(Camera):
         success = self.videocapture.set(cv2.CAP_PROP_FPS, float(self.fps))
         actual_fps = self.videocapture.get(cv2.CAP_PROP_FPS)
         # Use math.isclose for robust float comparison
-        if not success or not math.isclose(self.fps, actual_fps, rel_tol=1e-3):
+        # Note: Some camera drivers return False from set() even when FPS is set correctly.
+        # We only check if the actual FPS matches the requested one.
+        if not math.isclose(self.fps, actual_fps, rel_tol=1e-3):
             raise RuntimeError(f"{self} failed to set fps={self.fps} ({actual_fps=}).")
 
     def _validate_fourcc(self) -> None:
@@ -274,13 +342,15 @@ class OpenCVCamera(Camera):
         height_success = self.videocapture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.capture_height))
 
         actual_width = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_WIDTH)))
-        if not width_success or self.capture_width != actual_width:
+        # Note: Some camera drivers return False from set() even when the resolution is set correctly.
+        # We only check if the actual resolution matches the requested one.
+        if self.capture_width != actual_width:
             raise RuntimeError(
                 f"{self} failed to set capture_width={self.capture_width} ({actual_width=}, {width_success=})."
             )
 
         actual_height = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-        if not height_success or self.capture_height != actual_height:
+        if self.capture_height != actual_height:
             raise RuntimeError(
                 f"{self} failed to set capture_height={self.capture_height} ({actual_height=}, {height_success=})."
             )
@@ -480,12 +550,13 @@ class OpenCVCamera(Camera):
         Reads the latest available frame asynchronously.
 
         This method retrieves the most recent frame captured by the background
-        read thread. It does not block waiting for the camera hardware directly,
-        but may wait up to timeout_ms for the background thread to provide a frame.
+        read thread. If a frame is already available, it returns immediately
+        without waiting. Only waits if no frame has been captured yet.
 
         Args:
             timeout_ms (float): Maximum time in milliseconds to wait for a frame
-                to become available. Defaults to 200ms (0.2 seconds).
+                to become available (only used if no frame exists yet). 
+                Defaults to 200ms (0.2 seconds).
 
         Returns:
             np.ndarray: The latest captured frame as a NumPy array in the format
@@ -502,6 +573,12 @@ class OpenCVCamera(Camera):
         if self.thread is None or not self.thread.is_alive():
             self._start_read_thread()
 
+        # First check if we already have a frame available
+        with self.frame_lock:
+            if self.latest_frame is not None:
+                return self.latest_frame
+
+        # No frame yet, wait for one
         if not self.new_frame_event.wait(timeout=timeout_ms / 1000.0):
             thread_alive = self.thread is not None and self.thread.is_alive()
             raise TimeoutError(
@@ -511,7 +588,6 @@ class OpenCVCamera(Camera):
 
         with self.frame_lock:
             frame = self.latest_frame
-            self.new_frame_event.clear()
 
         if frame is None:
             raise RuntimeError(f"Internal error: Event set but no frame available for {self}.")

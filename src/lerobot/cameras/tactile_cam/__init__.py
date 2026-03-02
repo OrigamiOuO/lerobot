@@ -8,13 +8,11 @@
 - GradientProcessor: 基于梯度的图像处理器
 - MLPProcessor: 基于神经网络的图像处理器
 - TactileVisualizer: 可视化工具
-- BGRXYMLPNet: 与gs_sdk一致的MLP网络
 """
 
 from .tactile_camera import TactileCamera
 from .tactile_config import TactileCameraConfig
 from .processors import LookupTableProcessor, GradientProcessor, MLPProcessor, BaseProcessor
-from .model import BGRXYMLPNet, MLPGradientEncoder
 from .visualization import (
     TactileVisualizer,
     visualize_depth,
@@ -32,9 +30,6 @@ __all__ = [
     "LookupTableProcessor", 
     "GradientProcessor",
     "MLPProcessor",
-    # Models
-    "BGRXYMLPNet",
-    "MLPGradientEncoder",
     # Visualization
     "TactileVisualizer",
     "visualize_depth",

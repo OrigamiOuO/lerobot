@@ -1,4 +1,5 @@
 """
+MLP训练数据收集脚本 (v2 - 与gs_sdk一致)
 
 使用标准球压印采集训练数据：
 1. 拍摄参考图和球压印图
@@ -21,6 +22,7 @@ import numpy as np
 import os
 import sys
 import glob
+from PIL import Image, ImageDraw, ImageFont
 
 # 确保可以导入 lerobot 模块
 _current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -32,6 +34,47 @@ from lerobot.cameras.tactile_cam.tactile_camera import TactileCamera
 from lerobot.cameras.tactile_cam.tactile_config import TactileCameraConfig
 from lerobot.cameras.tactile_cam.processors import BaseProcessor
 from lerobot.cameras.configs import ColorMode, Cv2Rotation
+
+
+def cv2_put_chinese_text(img, text, position, font_size=20, color=(0, 255, 0)):
+    """
+    在OpenCV图像上绘制中文文字
+    
+    Args:
+        img: OpenCV图像 (BGR)
+        text: 要显示的文字
+        position: (x, y) 位置
+        font_size: 字体大小
+        color: BGR颜色
+    Returns:
+        绘制后的图像
+    """
+    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+    
+    # 尝试使用系统中文字体
+    font_paths = [
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    font = None
+    for fp in font_paths:
+        if os.path.exists(fp):
+            try:
+                font = ImageFont.truetype(fp, font_size)
+                break
+            except:
+                continue
+    if font is None:
+        font = ImageFont.load_default()
+    
+    # PIL使用RGB颜色
+    rgb_color = (color[2], color[1], color[0])
+    draw.text(position, text, font=font, fill=rgb_color)
+    
+    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
 
 def image2bgrxys(image: np.ndarray) -> np.ndarray:
@@ -58,8 +101,8 @@ def image2bgrxys(image: np.ndarray) -> np.ndarray:
 class MLPDataCollectorV2(BaseProcessor):
     """MLP训练数据收集器 (v2 - 与gs_sdk一致)"""
     
-    def __init__(self, ball_radius_mm: float = 4.0, ppmm: float = 7.6,
-                 pad: int = 20, calib_file: str = None, has_marker: bool = False):
+    def __init__(self, ball_radius_mm: float = 4.0, ppmm: float = 19.6,
+                 pad: int = 20, calib_file: str = None, has_marker: bool = True):
         """
         初始化数据收集器
         
@@ -188,7 +231,7 @@ class MLPDataCollectorV2(BaseProcessor):
         # 创建坐标网格
         xs = np.arange(w)
         ys = np.arange(h)
-        xv, yv = np.meshgrid(xs, ys, indexing="xy")
+        xv, yv = np.meshgrid(xs, ys, indexing="xy")     
         
         # 相对于圆心的坐标
         dxys = np.stack([xv - center[0], yv - center[1]], axis=-1)
@@ -260,8 +303,8 @@ class MLPDataCollectorV2(BaseProcessor):
         }
 
 
-def process_existing_data(data_dir: str, ppmm: float = 7.6, ball_radius_mm: float = 4.0,
-                          has_marker: bool = False, radius_reduction: float = 4.0,
+def process_existing_data(data_dir: str, ppmm: float = 19.6, ball_radius_mm: float = 4.0,
+                          has_marker: bool = True, radius_reduction: float = 4.0,
                           use_labels: bool = True):
     """
     处理已有的采集数据目录
@@ -395,6 +438,180 @@ def process_existing_data(data_dir: str, ppmm: float = 7.6, ball_radius_mm: floa
     }
 
 
+def realtime_capture(save_dir: str, ppmm: float = 19.6, ball_radius_mm: float = 4.0,
+                     has_marker: bool = False, calib_file: str = None):
+    """
+    实时连接相机采集标定数据
+    
+    Args:
+        save_dir: 数据保存目录
+        ppmm: 像素每毫米
+        ball_radius_mm: 球半径
+        has_marker: 是否有marker
+        calib_file: 透视变换矩阵文件
+    """
+    import time
+    
+    # 相机配置
+    camera_config = TactileCameraConfig(
+        index_or_path="/dev/video0",
+        fps=25,
+        width=640,
+        height=480,
+        color_mode=ColorMode.RGB,
+        rotation=Cv2Rotation.NO_ROTATION,
+        exposure=600,
+        auto_exposure=False,
+        wb_temperature=4000,
+        auto_wb=False,
+        r_gain=1.0,
+        g_gain=1.0,
+        b_gain=1.0,
+    )
+    
+    pad = 20
+    
+    # 初始化收集器
+    collector = MLPDataCollectorV2(
+        ball_radius_mm=ball_radius_mm,
+        ppmm=ppmm,
+        pad=pad,
+        calib_file=calib_file,
+        has_marker=has_marker
+    )
+    
+    # 确保保存目录存在
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 初始化相机
+    camera = TactileCamera(camera_config)
+    
+    print("\n" + "=" * 60)
+    print("MLP训练数据收集 (v2 - 实时采集模式)")
+    print("=" * 60)
+    print(f"球半径: {ball_radius_mm} mm")
+    print(f"ppmm: {ppmm:.2f} pixel/mm")
+    print(f"球半径(像素): {ball_radius_mm * ppmm:.1f} pixels")
+    print(f"是否有marker: {has_marker}")
+    print("=" * 60)
+    
+    # 检查是否有已存在的数据
+    ref_path = os.path.join(save_dir, "ref.jpg")
+    sample_count = 0
+    
+    if os.path.exists(ref_path):
+        # 统计已有样本
+        sample_files = [f for f in os.listdir(save_dir) if f.startswith("sample_") and f.endswith(".jpg")]
+        sample_count = len(sample_files)
+        print(f"\n[INFO] 发现已有数据: {sample_count} 个样本")
+        print("选择操作模式:")
+        print("  [c] 继续采集")
+        print("  [n] 重新采集")
+        print("  [q] 退出")
+        
+        while True:
+            choice = input("\n请输入选择 [c/n/q]: ").strip().lower()
+            if choice == 'c':
+                ref_img = cv2.imread(ref_path)
+                collector.set_reference(collector._crop_image(ref_img))
+                print(f"[INFO] 从样本 {sample_count + 1} 继续采集")
+                break
+            elif choice == 'n':
+                for f in os.listdir(save_dir):
+                    if f.startswith("sample_") or f in ["ref.jpg"]:
+                        os.remove(os.path.join(save_dir, f))
+                sample_count = 0
+                print("[INFO] 已清除，重新开始采集")
+                break
+            elif choice == 'q':
+                return None
+            else:
+                print("[WARNING] 无效选择")
+    
+    print("\n操作说明:")
+    print("  r: 拍摄参考图（无接触）")
+    print("  空格: 拍摄标定球图像")
+    print("  q: 保存并退出")
+    print("=" * 60 + "\n")
+    
+    try:
+        camera.connect()
+        print("[INFO] 相机已连接")
+        time.sleep(1)
+        
+        while True:
+            # 读取帧
+            frame = camera.async_read(timeout_ms=200)
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            
+            # 透视变换
+            warped = collector.warp_perspective(frame_bgr)
+            cropped = collector._crop_image(warped)
+            
+            # 显示
+            display = cropped.copy()
+            status = f"样本: {sample_count}"
+            if collector.ref_image is None:
+                status += " | 按'r'设置参考图"
+            display = cv2_put_chinese_text(display, status, (10, 10), font_size=18, color=(0, 255, 0))
+            cv2.imshow('MLP Data Collection V2', display)
+            
+            key = cv2.waitKey(1) & 0xFF
+            
+            if key == ord('q'):
+                break
+            
+            elif key == ord('r'):
+                collector.set_reference(cropped)
+                cv2.imwrite(os.path.join(save_dir, "ref.jpg"), warped)
+                print("[INFO] 参考图已保存")
+            
+            elif key == ord(' '):
+                if collector.ref_image is None:
+                    print("[WARNING] 请先按'r'设置参考图")
+                    continue
+                
+                # 获取marker掩膜
+                if has_marker:
+                    marker_mask = collector.get_marker_mask(cropped)
+                else:
+                    marker_mask = np.zeros_like(cropped[:, :, 0], dtype=np.uint8)
+                
+                # 交互式检测接触区域
+                contact_mask, center, radius = collector.contact_detection(
+                    cropped, collector.ref_image, marker_mask
+                )
+                
+                if contact_mask is None:
+                    print("[INFO] 跳过此样本")
+                    continue
+                
+                sample_count += 1
+                
+                # 保存图像
+                img_path = os.path.join(save_dir, f"sample_{sample_count}.jpg")
+                cv2.imwrite(img_path, warped)
+                
+                # 保存标注
+                label_path = os.path.join(save_dir, f"sample_{sample_count}.txt")
+                with open(label_path, 'w') as f:
+                    # 保存裁剪后的坐标（需要加上pad偏移）
+                    f.write(f"{center[0] + pad} {center[1] + pad} {radius}\n")
+                
+                print(f"[INFO] 样本 {sample_count} 已保存")
+    
+    except KeyboardInterrupt:
+        print("\n[INFO] 用户中断")
+    
+    finally:
+        cv2.destroyAllWindows()
+        camera.disconnect()
+        print("[INFO] 相机已断开")
+    
+    print(f"[INFO] 共采集 {sample_count} 个样本，保存在: {save_dir}")
+    return save_dir
+
+
 def main():
     """主函数"""
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -406,8 +623,11 @@ def main():
     
     # 参数设置
     BALL_RADIUS_MM = 4.0  # 标定球半径 (mm)
-    HAS_MARKER = False
+    HAS_MARKER = True
     RADIUS_REDUCTION = 4.0  # 半径缩减量（像素）
+    
+    # 透视变换矩阵文件
+    calib_file = os.path.join(current_dir, "calibration_data", "homography_matrix.npz")
     
     # 尝试加载 ppmm (从 mm_per_pixel 转换)
     mm_per_pixel_file = os.path.join(current_dir, "calibration_data", "mm_per_pixel.npz")
@@ -417,28 +637,56 @@ def main():
         PPMM = 1.0 / mm_per_pixel  # 转换为 pixel per mm
         print(f"[INFO] 加载 mm_per_pixel: {mm_per_pixel:.4f}, ppmm: {PPMM:.2f}")
     else:
-        PPMM = 7.6  # 默认值 (GelSight Mini)
+        PPMM = 19.6  # 默认值 (GelSight Mini)
         print(f"[WARNING] 使用默认 ppmm: {PPMM:.2f}")
     
     print("\n" + "=" * 60)
     print("MLP训练数据收集 (v2 - 与gs_sdk一致)")
     print("=" * 60)
+    print("选择模式:")
+    print("  [1] 实时采集 - 连接相机采集新数据")
+    print("  [2] 处理已有数据 - 处理现有图像目录")
+    print("  [q] 退出")
+    
+    while True:
+        choice = input("\n请输入选择 [1/2/q]: ").strip().lower()
+        if choice == '1':
+            # 实时采集模式
+            capture_dir = realtime_capture(
+                save_dir=data_dir,
+                ppmm=PPMM,
+                ball_radius_mm=BALL_RADIUS_MM,
+                has_marker=HAS_MARKER,
+                calib_file=calib_file
+            )
+            if capture_dir is None:
+                return
+            # 采集后继续处理数据
+            break
+        elif choice == '2':
+            # 处理已有数据模式
+            break
+        elif choice == 'q':
+            print("[INFO] 用户取消")
+            return
+        else:
+            print("[WARNING] 无效选择，请输入 1/2/q")
     
     # 检查数据目录
-    if os.path.exists(data_dir):
-        print(f"[INFO] 使用已有数据目录: {data_dir}")
-        result = process_existing_data(
-            data_dir, 
-            ppmm=PPMM, 
-            ball_radius_mm=BALL_RADIUS_MM,
-            has_marker=HAS_MARKER,
-            radius_reduction=RADIUS_REDUCTION,
-            use_labels=True  # 使用已有的标注文件
-        )
-    else:
+    if not os.path.exists(data_dir):
         print(f"[ERROR] 数据目录不存在: {data_dir}")
-        print("[INFO] 请先采集数据或指定正确的数据目录")
+        print("[INFO] 请先采集数据")
         return
+    
+    print(f"\n[INFO] 处理数据目录: {data_dir}")
+    result = process_existing_data(
+        data_dir, 
+        ppmm=PPMM, 
+        ball_radius_mm=BALL_RADIUS_MM,
+        has_marker=HAS_MARKER,
+        radius_reduction=RADIUS_REDUCTION,
+        use_labels=True  # 使用已有的标注文件
+    )
     
     if result is None:
         return

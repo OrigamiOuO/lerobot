@@ -50,6 +50,19 @@ def _is_scalar(x):
     )
 
 
+def _is_image_array(arr: np.ndarray) -> bool:
+    """Check if array looks like an image (HWC or CHW format with valid channel count)."""
+    if arr.ndim != 3:
+        return False
+    # HWC format: last dimension is channels (1, 3, or 4)
+    if arr.shape[-1] in (1, 3, 4) and arr.shape[0] > 4 and arr.shape[1] > 4:
+        return True
+    # CHW format: first dimension is channels (1, 3, or 4)  
+    if arr.shape[0] in (1, 3, 4) and arr.shape[1] > 4 and arr.shape[2] > 4:
+        return True
+    return False
+
+
 def log_rerun_data(
     observation: RobotObservation | None = None,
     action: RobotAction | None = None,
@@ -83,15 +96,43 @@ def log_rerun_data(
                 rr.log(key, rr.Scalars(float(v)))
             elif isinstance(v, np.ndarray):
                 arr = v
-                # Convert CHW -> HWC when needed
-                if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
-                    arr = np.transpose(arr, (1, 2, 0))
-                if arr.ndim == 1:
-                    for i, vi in enumerate(arr):
-                        rr.log(f"{key}_{i}", rr.Scalars(float(vi)))
-                else:
+                
+                # Check if it's an image-like array
+                if _is_image_array(arr):
+                    # Convert CHW -> HWC when needed
+                    if arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+                        arr = np.transpose(arr, (1, 2, 0))
+                    
+                    # Handle depth maps (single channel float) - normalize for visualization
+                    if arr.shape[-1] == 1 and arr.dtype in (np.float32, np.float64):
+                        # Normalize depth to 0-255 for visualization
+                        depth_min, depth_max = arr.min(), arr.max()
+                        if depth_max > depth_min:
+                            arr_vis = ((arr - depth_min) / (depth_max - depth_min) * 255).astype(np.uint8)
+                        else:
+                            arr_vis = np.zeros_like(arr, dtype=np.uint8)
+                        arr = np.repeat(arr_vis, 3, axis=-1)  # Convert to RGB
+                    
+                    # Handle normal maps (3 channel float) - convert to 0-255
+                    elif arr.shape[-1] == 3 and arr.dtype in (np.float32, np.float64):
+                        # Normal vectors are typically in [-1, 1], map to [0, 255]
+                        arr = ((arr + 1) * 0.5 * 255).clip(0, 255).astype(np.uint8)
+                    
                     img_entity = rr.Image(arr).compress() if compress_images else rr.Image(arr)
                     rr.log(key, entity=img_entity, static=True)
+                elif arr.ndim == 1:
+                    for i, vi in enumerate(arr):
+                        rr.log(f"{key}_{i}", rr.Scalars(float(vi)))
+                elif arr.ndim == 2:
+                    # 2D array like marker_displacement (N, 2) - log as scalars
+                    for i in range(arr.shape[0]):
+                        for j in range(arr.shape[1]):
+                            rr.log(f"{key}_{i}_{j}", rr.Scalars(float(arr[i, j])))
+                else:
+                    # Fall back to flattening
+                    flat = arr.flatten()
+                    for i, vi in enumerate(flat):
+                        rr.log(f"{key}_{i}", rr.Scalars(float(vi)))
 
     if action:
         for k, v in action.items():

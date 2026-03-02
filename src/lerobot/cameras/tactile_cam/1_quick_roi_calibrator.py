@@ -219,7 +219,7 @@ class QuickROICalibrator:
                     self._init_default_roi()
                     print("[INFO] 已重置为默认ROI")
                 elif key == ord('s'):
-                    self.save_calibration(filename="homography_matrix.npz")
+                    self.save_calibration(filename="homography_matrix_320x240.npz")
                 elif key == ord('q'):
                     break
                     
