@@ -186,6 +186,7 @@ class SOFollower(Robot):
                 
                 # Initialize marker tracker for each tactile camera
                 self.marker_trackers[name] = GelSightMarkerTracker()
+                self.marker_trackers[name].IsDisplay = False  # 禁止在worker线程中弹出Qt窗口
                 
                 # Initialize MLP processor for depth and normal reconstruction
                 self.tactile_processors[name] = MLPProcessor(

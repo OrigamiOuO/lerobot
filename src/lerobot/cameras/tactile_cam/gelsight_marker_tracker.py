@@ -68,7 +68,8 @@ class GelSightMarkerTracker:
         self.markerV = np.zeros(self.MarkerCount)  # Y方向运动
         
         # 创建显示窗口
-        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        if self.IsDisplay:
+            cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
 
     # def _loc_markerArea(self):
     #     """定位标记点区域（适用于Bnz GelSight）"""

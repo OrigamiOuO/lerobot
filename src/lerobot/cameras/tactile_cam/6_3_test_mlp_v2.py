@@ -242,7 +242,8 @@ class MLPProcessorV2(BaseProcessor):
     """
     
     def __init__(self, model_path: str = None, pad: int = 20,
-                 calib_file: str = None, device: str = None, ppmm: float = 7.6):
+                 calib_file: str = None, device: str = None, ppmm: float = 7.6,
+                 blur_ksize: int = 5):
         """
         初始化处理器
         
@@ -252,6 +253,7 @@ class MLPProcessorV2(BaseProcessor):
             calib_file: 透视变换矩阵文件路径
             device: 计算设备
             ppmm: 像素每毫米
+            blur_ksize: 高斯模糊核大小 (奇数, 0=关闭)
         """
         # 如果没有指定标定文件，使用默认路径
         if calib_file is None:
@@ -267,6 +269,10 @@ class MLPProcessorV2(BaseProcessor):
             self.device = device
         
         self.ppmm = ppmm
+        # 高斯模糊核大小 (奇数, 0=关闭)
+        if blur_ksize > 0 and blur_ksize % 2 == 0:
+            blur_ksize += 1
+        self.blur_ksize = blur_ksize
         
         # 加载模型
         if model_path is None:
@@ -392,6 +398,13 @@ class MLPProcessorV2(BaseProcessor):
         # 获取表面信息
         G, H, C = self.reconstructor.get_surface_info(frame, self.ppmm)
         
+        # 高斯模糊降噪
+        if self.blur_ksize > 0:
+            ksize = (self.blur_ksize, self.blur_ksize)
+            H = cv2.GaussianBlur(H, ksize, 0)
+            G[:, :, 0] = cv2.GaussianBlur(G[:, :, 0], ksize, 0)
+            G[:, :, 1] = cv2.GaussianBlur(G[:, :, 1], ksize, 0)
+        
         # 可视化
         depth_colored = self._colorize_depth(H)
         normal_colored = self._colorize_normals(G)
@@ -480,7 +493,7 @@ def main():
     
     # 相机配置
     camera_config = TactileCameraConfig(
-        index_or_path="/dev/video0",
+        index_or_path="/dev/video4",
         fps=25,
         width=640,
         height=480,
@@ -511,9 +524,13 @@ def main():
         PPMM = 7.6
         print(f"[WARNING] 使用默认 ppmm: {PPMM:.2f}")
     
+    # 高斯模糊核大小 (奇数), 越大越平滑; 0=关闭
+    BLUR_KSIZE = 0
+    
     # 初始化组件
     camera = TactileCamera(camera_config)
-    processor = MLPProcessorV2(ppmm=PPMM)
+    processor = MLPProcessorV2(ppmm=PPMM, blur_ksize=BLUR_KSIZE)
+    print(f"[INFO] 高斯模糊: ksize={BLUR_KSIZE}" if BLUR_KSIZE > 0 else "[INFO] 高斯模糊: 关闭")
     visualizer = TactileVisualizer(
         windows=['original', 'depth', 'normal', 'gradient', 'marker'],
         window_size=(640, 480)
