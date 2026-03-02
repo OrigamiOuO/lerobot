@@ -74,6 +74,7 @@ class SOFollower(Robot):
         self.marker_trackers: dict[str, GelSightMarkerTracker] = {}
         self._tactile_initialized: dict[str, bool] = {}
         self._num_markers = config.num_markers
+        self._marker_threshold = getattr(config, 'marker_threshold', 0.5)
         
         # Legacy single tactile camera support (backward compatible)
         if config.tactile_camera is not None:
@@ -113,11 +114,13 @@ class SOFollower(Robot):
         for name in self.tactile_cameras:
             # For single legacy camera "tactile", use original names for backward compatibility
             if name == "tactile" and len(self.tactile_cameras) == 1:
+                features["tactile_raw"] = (480, 640, 3)
                 features["tactile_depth"] = (480, 640, 1)
                 features["tactile_normal"] = (480, 640, 3)
                 features["marker_displacement"] = (self._num_markers, 2)
             else:
                 # For multiple cameras, use prefixed names
+                features[f"{name}_raw"] = (480, 640, 3)
                 features[f"{name}_depth"] = (480, 640, 1)
                 features[f"{name}_normal"] = (480, 640, 3)
                 features[f"{name}_marker_displacement"] = (self._num_markers, 2)
@@ -420,16 +423,21 @@ class SOFollower(Robot):
                 # Pad or truncate to match expected number of markers
                 n = min(len(displacements), self._num_markers)
                 marker_displacement[:n] = displacements[:n]
+                # 阈值过滤：将幅值小于阈值的位移归零（抑制无接触时的噪声）
+                mag = np.sqrt(marker_displacement[:, 0]**2 + marker_displacement[:, 1]**2)
+                marker_displacement[mag < self._marker_threshold] = 0.0
         
         # Use appropriate key names based on whether this is single or multiple camera setup
         if name == "tactile" and len(self.tactile_cameras) == 1:
             return {
+                "tactile_raw": warped_frame,
                 "tactile_depth": depth,
                 "tactile_normal": normal,
                 "marker_displacement": marker_displacement,
             }
         else:
             return {
+                f"{name}_raw": warped_frame,
                 f"{name}_depth": depth,
                 f"{name}_normal": normal,
                 f"{name}_marker_displacement": marker_displacement,

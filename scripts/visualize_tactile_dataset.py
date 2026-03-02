@@ -24,6 +24,7 @@ import numpy as np
 import cv2
 import pyarrow.parquet as pq
 import pyarrow as pa
+import pyarrow.compute as pc
 
 
 # ──────────────────── 着色函数（与 6_3_test_mlp_v2.py 一致）────────────────────
@@ -93,7 +94,7 @@ def visualize_marker_displacement(disp: np.ndarray, canvas_size=(480, 640)) -> n
 # ──────────────────── 数据集加载（使用 pyarrow 高效读取）────────────────────
 
 class TactileDataset:
-    """高效加载触觉数据集"""
+    """高效加载触觉数据集（启动时预加载全部帧到内存）"""
 
     def __init__(self, dataset_path: str):
         parquet_files = sorted(glob.glob(
@@ -110,6 +111,10 @@ class TactileDataset:
         self.normal_col = self._find_col('normal')
         self.marker_col = self._find_col('displacement', 'marker')
 
+        # 预加载所有触觉数据到内存
+        self._cache: dict[str, list[np.ndarray]] = {}
+        self._preload()
+
     def _find_col(self, *keywords):
         for col in self.columns:
             cl = col.lower()
@@ -121,7 +126,27 @@ class TactileDataset:
                 return col
         return None
 
+    def _preload(self):
+        """预加载所有触觉列到 numpy（使用 Arrow C++ 层批量展平，极快）"""
+        cols = [c for c in (self.depth_col, self.normal_col, self.marker_col) if c]
+        for col in cols:
+            print(f"  预加载 {col} ({self.num_frames} 帧)...", end=" ", flush=True)
+            arrow_col = self.table.column(col)
+            # 从第一帧推断 shape
+            sample = np.array(arrow_col[0].as_py(), dtype=np.float32)
+            shape = sample.shape
+            # 用 Arrow C++ list_flatten 逐层展平，避免 Python 循环
+            flat = arrow_col
+            while pa.types.is_list(flat.type):
+                flat = pc.list_flatten(flat)
+            # 一次性转 numpy 并 reshape 为 (num_frames, *shape)
+            all_data = flat.to_numpy(zero_copy_only=False).astype(np.float32)
+            self._cache[col] = all_data.reshape(self.num_frames, *shape)
+            print("✅")
+
     def get_frame(self, idx: int, col: str) -> np.ndarray:
+        if col in self._cache:
+            return self._cache[col][idx]
         val = self.table.column(col)[idx].as_py()
         return np.array(val, dtype=np.float32)
 
@@ -136,16 +161,11 @@ class TactileDataset:
 def main():
     parser = argparse.ArgumentParser(description="触觉数据集可视化工具")
     parser.add_argument("--dataset", type=str, default="./datasets/task2", help="数据集路径")
-    parser.add_argument("--fps", type=int, default=30, help="回放帧率")
+    parser.add_argument("--fps", type=int, default=15, help="回放帧率")
     parser.add_argument("--start", type=int, default=0, help="起始帧")
     parser.add_argument("--end", type=int, default=-1, help="结束帧 (-1=全部)")
     parser.add_argument("--save-dir", type=str, default=None, help="截图保存目录")
-    parser.add_argument("--blur", type=int, default=5, help="高斯模糊核大小 (奇数, 0=关闭)")
     args = parser.parse_args()
-
-    # 保证核大小为奇数
-    if args.blur > 0 and args.blur % 2 == 0:
-        args.blur += 1
 
     ds = TactileDataset(args.dataset)
     print(f"✅ 加载了 {ds.num_frames} 帧数据")
@@ -193,20 +213,14 @@ def main():
 
         if ds.depth_col:
             depth = ds.get_frame(idx, ds.depth_col)
-            if args.blur > 0:
-                d2 = depth.squeeze(-1) if depth.ndim == 3 else depth
-                d2 = cv2.GaussianBlur(d2, (args.blur, args.blur), 0)
-                depth = d2[:, :, None] if depth.ndim == 3 else d2
             depth_vis = colorize_depth(depth)
-            cv2.putText(depth_vis, f"Depth (blur={args.blur})", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(depth_vis, "Depth", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             panels.append(depth_vis)
 
         if ds.normal_col:
             normal = ds.get_frame(idx, ds.normal_col)
-            if args.blur > 0:
-                normal = cv2.GaussianBlur(normal, (args.blur, args.blur), 0)
             normal_vis = colorize_normals(normal)
-            cv2.putText(normal_vis, f"Normal (blur={args.blur})", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(normal_vis, "Normal", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             panels.append(normal_vis)
 
         if ds.marker_col:

@@ -50,6 +50,10 @@ class SOFollowerConfig:
     # Number of marker points for tactile sensor
     num_markers: int = 35
 
+    # Marker displacement threshold (pixels). Displacements with magnitude below
+    # this value are zeroed out to suppress noise when there is no contact.
+    marker_threshold: float = 0.5
+
     # Set to `True` for backward compatibility with previous policies/dataset
     use_degrees: bool = False
 
