@@ -20,10 +20,10 @@ from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
 
 
-@PreTrainedConfig.register_subclass("act")
+@PreTrainedConfig.register_subclass("tactile_act")
 @dataclass
-class ACTConfig(PreTrainedConfig):
-    """Configuration class for the Action Chunking Transformers policy.
+class TactileACTConfig(PreTrainedConfig):
+    """Configuration class for the Tactile Action Chunking Transformers policy.
 
     Defaults are configured for training on bimanual Aloha tasks like "insertion" or "transfer".
 
@@ -91,7 +91,7 @@ class ACTConfig(PreTrainedConfig):
     """
 
     # Input / output structure.
-    n_obs_steps: int = 1
+    n_obs_steps: int = 5  # Changed from 1 to support multi-frame history
     chunk_size: int = 100
     n_action_steps: int = 100
 
@@ -108,6 +108,11 @@ class ACTConfig(PreTrainedConfig):
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
+    
+    # Tactile features.
+    use_tactile_features: bool = True
+    tactile_encoder_hidden_dim: int = 64
+    
     # Transformer layers.
     pre_norm: bool = False
     dim_model: int = 512
@@ -155,10 +160,7 @@ class ACTConfig(PreTrainedConfig):
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
             )
-        if self.n_obs_steps != 1:
-            raise ValueError(
-                f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
-            )
+        # Note: Removed the n_obs_steps != 1 check to support multi-frame history
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
@@ -170,16 +172,29 @@ class ACTConfig(PreTrainedConfig):
         return None
 
     def validate_features(self) -> None:
-        if not self.image_features and not self.env_state_feature:
-            raise ValueError("You must provide at least one image or the environment state among the inputs.")
+        # Allow tactile-only mode (without vision or env_state)
+        # Original ACT required at least one of: image_features OR env_state
+        # Tactile ACT relaxes this: robot_state + tactile is sufficient
+        if not self.image_features and not self.env_state_feature and not self.robot_state_feature:
+            raise ValueError("You must provide at least one of: image features, environment state, or robot state among the inputs.")
 
     @property
-    def observation_delta_indices(self) -> None:
-        return None
+    def observation_delta_indices(self) -> list:
+        """Returns indices for multi-frame observation history.
+        
+        For n_obs_steps=2, returns [-1, 0] meaning frames at t-1 and t.
+        This enables the policy to perceive motion/velocity information.
+        """
+        return list(range(1 - self.n_obs_steps, 1))
 
     @property
     def action_delta_indices(self) -> list:
-        return list(range(self.chunk_size))
+        """Returns indices for action chunk prediction.
+        
+        For chunk_size=100 and n_obs_steps=2, returns [-1, 0, 1, ..., 98]
+        This aligns action predictions with the observation window.
+        """
+        return list(range(1 - self.n_obs_steps, 1 - self.n_obs_steps + self.chunk_size))
 
     @property
     def reward_delta_indices(self) -> None:

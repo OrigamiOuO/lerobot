@@ -39,7 +39,7 @@ class TactileDiffusionConfig(PreTrainedConfig):
     """
 
     # Inputs / output structure.
-    n_obs_steps: int = 2
+    n_obs_steps: int = 5
     horizon: int = 16
     n_action_steps: int = 8
 

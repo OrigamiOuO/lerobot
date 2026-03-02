@@ -173,6 +173,21 @@ class TactileDiffusionModel(nn.Module):
                 nn.ReLU(),
                 nn.Linear(self.config.tactile_encoder_hidden_dim, self.config.tactile_encoder_hidden_dim)
             )
+            
+            # Add Transformer encoder for temporal modeling of tactile features
+            tactile_encoder_layer = nn.TransformerEncoderLayer(
+                d_model=self.config.tactile_encoder_hidden_dim,
+                nhead=4,
+                dim_feedforward=self.config.tactile_encoder_hidden_dim * 2,
+                batch_first=True,
+                dropout=0.1,
+            )
+            self.tactile_temporal_transformer = nn.TransformerEncoder(
+                tactile_encoder_layer,
+                num_layers=2
+            )
+            
+            # global_cond_dim now uses the pooled representation from transformer
             global_cond_dim += self.config.tactile_encoder_hidden_dim
         
         # NOTE: No RGB encoder for blind policy
@@ -236,11 +251,11 @@ class TactileDiffusionModel(nn.Module):
         return sample
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
-        """Encode tactile features and concatenate with state vector (no vision for blind policy)."""
+        """Encode tactile features with temporal transformer and concatenate with state vector."""
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
         global_cond_feats = [batch[OBS_STATE]]
         
-        # Extract and encode tactile features
+        # Extract and encode tactile features with temporal modeling
         if self.config.use_tactile_features and OBS_TACTILE1 in batch:
             # Both should have shape (B, n_obs_steps, feature_dim)
             tactile_fsr = batch[OBS_TACTILE1]     # (B, n_obs_steps, 12)
@@ -249,15 +264,24 @@ class TactileDiffusionModel(nn.Module):
             # Concatenate along feature dimension
             tactile_features = torch.cat([tactile_fsr, tactile_taxel], dim=-1)  # (B, n_obs_steps, 44)
             
-            # Encode tactile features
+            # Step 1: Encode each frame individually through MLP
             # Flatten batch and sequence dims for encoding
             tactile_flat = einops.rearrange(tactile_features, "b s d -> (b s) d")
-            tactile_encoded = self.tactile_encoder(tactile_flat)
+            tactile_encoded = self.tactile_encoder(tactile_flat)  # (B*n_obs_steps, hidden_dim)
             # Restore batch and sequence dims
             tactile_encoded = einops.rearrange(
                 tactile_encoded, "(b s) d -> b s d", b=batch_size, s=n_obs_steps
+            )  # (B, n_obs_steps, hidden_dim)
+            
+            # Step 2: Process temporal sequence through Transformer
+            # This allows the model to learn temporal dependencies in tactile signals
+            tactile_transformed = self.tactile_temporal_transformer(  # (B, n_obs_steps, hidden_dim)
+                tactile_encoded
             )
-            global_cond_feats.append(tactile_encoded)
+            
+            # Keep temporal dimension intact - append transformed tactile features
+            # to global_cond_feats list
+            global_cond_feats.append(tactile_transformed)
         
         # NOTE: No image feature extraction for blind policy
 
@@ -265,6 +289,8 @@ class TactileDiffusionModel(nn.Module):
             global_cond_feats.append(batch[OBS_ENV_STATE])
 
         # Concatenate features then flatten to (B, global_cond_dim).
+        # All features are (B, n_obs_steps, feat_dim), so after concat and flatten:
+        # (B, n_obs_steps * (state_dim + tactile_hidden_dim + env_state_dim))
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
 
     def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:

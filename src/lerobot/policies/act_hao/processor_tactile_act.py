@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 
-from lerobot.policies.tactile_act.configuration_tactile_act import TactileACTConfig
+from lerobot.policies.act_hao.configuration_tactile_act import TactileACTConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -31,7 +31,7 @@ from lerobot.processor.converters import policy_action_to_transition, transition
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 
-def make_tactile_act_pre_post_processors(
+def make_tactile_act_hao_pre_post_processors(
     config: TactileACTConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[

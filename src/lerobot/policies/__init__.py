@@ -26,6 +26,8 @@ from .wall_x.configuration_wall_x import WallXConfig as WallXConfig
 from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 from .tactile_diffusion.configuration_tactile_diffusion import TactileDiffusionConfig as TactileDiffusionConfig
 from .tactile_blind_diffusion.configuration_tactile_blind_diffusion import TactileDiffusionConfig as TactileBlindDiffusionConfig
+from .tactile_act.configuration_tactile_act import TactileACTConfig as TactileACTConfig
+from .act_hao.configuration_tactile_act import TactileACTConfig as TactileACTHaoConfig
 
 __all__ = [
     "ACTConfig",
@@ -42,4 +44,6 @@ __all__ = [
     "WallXConfig",
     "TactileDiffusionConfig",
     "TactileBlindDiffusionConfig",
+    "TactileACTConfig",
+    "TactileACTHaoConfig",
 ]
