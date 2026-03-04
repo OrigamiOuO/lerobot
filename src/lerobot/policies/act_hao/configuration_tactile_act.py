@@ -25,11 +25,16 @@ from lerobot.optim.optimizers import AdamWConfig
 class TactileACTConfig(PreTrainedConfig):
     """Configuration class for Tactile ACT policy with GelSight tactile sensor support.
 
-    Supports three types of tactile data from GelSight sensors:
-        - Depth map (1-channel, image-like) and Normal map (3-channel, image-like):
-          Fused as a 4-channel input to a dedicated ResNet backbone (方案A).
-        - Marker displacement (35 markers × 2D coordinates):
-          Encoded as an independent 1D token in the transformer encoder (方案B).
+    Supports four types of tactile data from GelSight sensors (individually toggleable
+    for ablation experiments):
+        - Raw tactile RGB image (3ch): dedicated ResNet backbone (unfrozen BN).
+        - Depth map (1ch, image-like): ResNet backbone (unfrozen BN).
+        - Normal map (3ch, image-like): ResNet backbone (unfrozen BN).
+        - Marker displacement (35 markers × 2D coordinates): MLP encoder → 1D token.
+
+    When both depth and normal are enabled, they are fused into a single 4-channel
+    input to a shared ResNet backbone. When only one is enabled, the backbone uses
+    the corresponding number of input channels (1 or 3).
 
     Additionally supports:
         - Camera RGB images (processed by a separate ResNet backbone with FrozenBatchNorm2d).
@@ -37,20 +42,6 @@ class TactileACTConfig(PreTrainedConfig):
 
     The tactile backbone uses standard (unfrozen) BatchNorm2d for full fine-tuning,
     while the camera backbone uses FrozenBatchNorm2d following the original ACT design.
-
-    Args:
-        n_obs_steps: Number of observation steps. Fixed to 1 (single frame) for this version.
-        chunk_size: Action chunk size for prediction.
-        n_action_steps: Number of action steps to execute per policy invocation.
-        vision_backbone: ResNet variant for camera image encoding.
-        pretrained_backbone_weights: Pretrained weights for camera backbone.
-        tactile_vision_backbone: ResNet variant for tactile image (depth+normal) encoding.
-        pretrained_tactile_backbone_weights: Pretrained weights for tactile backbone.
-        use_tactile_image_features: Whether to use depth+normal tactile images.
-        use_tactile_marker: Whether to use marker displacement features.
-        tactile_marker_input_dim: Flattened dimension of marker displacement (35*2=70).
-        tactile_marker_hidden_dim: Hidden dimension for marker MLP encoder.
-        optimizer_lr_tactile_backbone: Learning rate for the tactile backbone.
     """
 
     # Input / output structure.
@@ -72,8 +63,18 @@ class TactileACTConfig(PreTrainedConfig):
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
 
-    # Tactile image features: depth (1ch) + normal (3ch) → 4ch ResNet (unfrozen BN).
-    use_tactile_image_features: bool = True
+    # Backbone freezing: when True, freeze ALL backbone conv/linear weights
+    # (only the 1×1 projection layers and Transformer are trained).
+    # Recommended for small datasets (<5000 frames) to prevent overfitting.
+    freeze_backbone: bool = False
+    freeze_tactile_backbone: bool = False
+    freeze_tactile_raw_backbone: bool = False
+
+    # Tactile image features: depth (1ch) and/or normal (3ch) → ResNet (unfrozen BN).
+    # Both can be independently toggled for ablation experiments.
+    # When both enabled: fused 4ch input. When one enabled: 1ch or 3ch input.
+    use_tactile_depth: bool = True
+    use_tactile_normal: bool = True
     tactile_vision_backbone: str = "resnet18"
     pretrained_tactile_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
 
@@ -128,7 +129,7 @@ class TactileACTConfig(PreTrainedConfig):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
             )
-        if self.use_tactile_image_features and not self.tactile_vision_backbone.startswith("resnet"):
+        if (self.use_tactile_depth or self.use_tactile_normal) and not self.tactile_vision_backbone.startswith("resnet"):
             raise ValueError(
                 f"`tactile_vision_backbone` must be one of the ResNet variants. Got {self.tactile_vision_backbone}."
             )
@@ -161,7 +162,7 @@ class TactileACTConfig(PreTrainedConfig):
         has_vision = bool(self.image_features)
         has_env = self.env_state_feature is not None
         has_state = self.robot_state_feature is not None
-        has_tactile = self.use_tactile_image_features or self.use_tactile_marker
+        has_tactile = self.use_tactile_depth or self.use_tactile_normal or self.use_tactile_marker or self.use_tactile_raw_image
 
         if not has_vision and not has_env and not has_state and not has_tactile:
             raise ValueError(

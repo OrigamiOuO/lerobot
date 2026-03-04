@@ -16,10 +16,15 @@
 """Tactile Action Chunking Transformer Policy (Hao variant)
 
 Based on ACT (https://huggingface.co/papers/2304.13705) with GelSight tactile sensor integration.
-Supports four tactile modalities:
+Supports four independently-toggleable tactile modalities (for ablation experiments):
   - Raw tactile RGB image (3ch) → dedicated ResNet backbone (unfrozen BN)
-  - Depth map (1ch) + Normal map (3ch) → fused 4-channel ResNet backbone (unfrozen BN)
+  - Depth map (1ch) → ResNet backbone (unfrozen BN)
+  - Normal map (3ch) → ResNet backbone (unfrozen BN)
   - Marker displacement (35×2) → independent 1D token via MLP encoder
+
+When both depth and normal are enabled, they are fused into a 4-channel input
+to a shared tactile backbone. When only one is enabled, the backbone adapts
+to the corresponding number of channels (1 or 3).
 """
 
 import math
@@ -212,30 +217,41 @@ class ACTTemporalEnsembler:
 class ACT(nn.Module):
     """Action Chunking Transformer with tactile sensor support.
 
+    All tactile modalities are independently toggleable for ablation experiments.
+
     Architecture overview:
-                                 Transformer
-                                 Used alone for inference
-                                 (acts as VAE decoder during training)
-                                ┌──────────────────────────────────┐
-                                │                Outputs           │
-                                │                   ▲              │
-                                │        ┌─────►┌───────┐         │
-                   ┌──────┐     │        │      │Transf.│         │
-                   │      │     │        ├─────►│decoder│         │
-              ┌────┴────┐ │     │        │      │       │         │
-              │         │ │     │ ┌──────┴──┬──►│       │         │
-              │ VAE     │ │     │ │         │   └───────┘         │
-              │ encoder │ │     │ │ Transf. │                     │
-              │         │ │     │ │ encoder │                     │
-              └───▲─────┘ │     │ │         │                     │
-                  │       │     │ └▲──▲─▲─▲─▲──▲─┘                │
-                  │       │     │  │  │ │ │ │  │                  │
-                inputs    └─────┼──┘  │ │ │ │  tac_raw img emb.  │
-                                │    │ │ │ tac depth+normal emb. │
-                                │    │ │ marker emb.             │
-                                │   │ state emb.                 │
-                                │  cam img emb.                  │
-                                └──────────────────────────────────┘
+                                  Transformer
+                                  Used alone for inference
+                                  (acts as VAE decoder during training)
+                                 ┌───────────────────────────────────────┐
+                                 │                 Outputs               │
+                                 │                    ▲                  │
+                                 │         ┌─────►┌───────┐             │
+                    ┌──────┐     │         │      │Transf.│             │
+                    │      │     │         ├─────►│decoder│             │
+               ┌────┴────┐ │     │         │      │       │             │
+               │         │ │     │  ┌──────┴──┬──►│       │             │
+               │ VAE     │ │     │  │         │   └───────┘             │
+               │ encoder │ │     │  │ Transf. │                         │
+               │         │ │     │  │ encoder │                         │
+               └───▲─────┘ │     │  │         │                         │
+                   │       │     │  └▲──▲─▲─▲─▲──▲─┘                    │
+                   │       │     │   │  │ │ │ │  │                      │
+                 inputs    └─────┼───┘  │ │ │ │  │                      │
+                                 │     │ │ │ │  (tac_raw img emb.)     │
+                                 │     │ │ │ (tac depth/normal emb.)   │
+                                 │     │ │ (marker emb.)               │
+                                 │     │ (state emb.)                  │
+                                 │    (cam img emb.)                   │
+                                 └───────────────────────────────────────┘
+
+    Tactile backbone input channels adapt dynamically:
+      - depth only        → 1ch ResNet
+      - normal only       → 3ch ResNet (uses ImageNet weights directly)
+      - depth + normal    → 4ch ResNet (fused)
+      - raw tactile image → separate 3ch ResNet
+      - marker            → MLP → 1D token
+    All marked with (...) are optional, controlled by config flags.
     """
 
     def __init__(self, config: TactileACTConfig):
@@ -277,33 +293,45 @@ class ACT(nn.Module):
             self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
 
         # =====================================================================
-        # 3) Tactile Image Backbone (4-channel ResNet, unfrozen BN)
-        #    Fuses depth (1ch) + normal (3ch) as a 4-channel input.
-        #    Pretrained weights: first 3 channels from ImageNet, 4th channel
-        #    initialized by copying the red channel weights.
+        # 3) Tactile Depth/Normal Backbone (dynamic channels, unfrozen BN)
+        #    Supports: depth only (1ch), normal only (3ch), or both (4ch).
+        #    Pretrained weights: first 3 channels from ImageNet.
+        #    For depth-only (1ch): weights initialized from red channel.
+        #    For depth+normal (4ch): 4th channel initialized from red channel.
         #    BatchNorm is NOT frozen → fully fine-tuned during training.
         # =====================================================================
-        if self.config.use_tactile_image_features:
+        self._tactile_in_channels = 0  # computed dynamically
+        if self.config.use_tactile_depth:
+            self._tactile_in_channels += 1
+        if self.config.use_tactile_normal:
+            self._tactile_in_channels += 3
+
+        if self._tactile_in_channels > 0:
             tac_backbone_model = getattr(torchvision.models, config.tactile_vision_backbone)(
                 replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
                 weights=config.pretrained_tactile_backbone_weights,
                 # No norm_layer override → default nn.BatchNorm2d (fully trainable)
             )
-            # Modify conv1: 3 channels → 4 channels (normal 3ch + depth 1ch)
-            old_conv1 = tac_backbone_model.conv1
-            new_conv1 = nn.Conv2d(
-                4, old_conv1.out_channels,
-                kernel_size=old_conv1.kernel_size,
-                stride=old_conv1.stride,
-                padding=old_conv1.padding,
-                bias=False,
-            )
-            with torch.no_grad():
-                # Copy pretrained weights for first 3 channels (normal map)
-                new_conv1.weight[:, :3] = old_conv1.weight
-                # Initialize 4th channel (depth) by copying red channel weights
-                new_conv1.weight[:, 3:4] = old_conv1.weight[:, 0:1]
-            tac_backbone_model.conv1 = new_conv1
+
+            if self._tactile_in_channels != 3:
+                # Need to modify conv1 for non-standard channel count
+                old_conv1 = tac_backbone_model.conv1
+                new_conv1 = nn.Conv2d(
+                    self._tactile_in_channels, old_conv1.out_channels,
+                    kernel_size=old_conv1.kernel_size,
+                    stride=old_conv1.stride,
+                    padding=old_conv1.padding,
+                    bias=False,
+                )
+                with torch.no_grad():
+                    if self._tactile_in_channels == 1:
+                        # Depth only: init from red channel
+                        new_conv1.weight[:, 0:1] = old_conv1.weight[:, 0:1]
+                    elif self._tactile_in_channels == 4:
+                        # Normal (3ch) + Depth (1ch): copy 3ch, init 4th from red
+                        new_conv1.weight[:, :3] = old_conv1.weight
+                        new_conv1.weight[:, 3:4] = old_conv1.weight[:, 0:1]
+                tac_backbone_model.conv1 = new_conv1
 
             # Save fc.in_features before IntermediateLayerGetter removes fc
             tac_backbone_fc_in_features = tac_backbone_model.fc.in_features
@@ -326,6 +354,21 @@ class ACT(nn.Module):
             self.tactile_raw_backbone = IntermediateLayerGetter(
                 tac_raw_backbone_model, return_layers={"layer4": "feature_map"}
             )
+
+        # =====================================================================
+        # 3c) Optionally freeze backbone weights (prevents overfitting on small datasets)
+        # =====================================================================
+        if self.config.image_features and self.config.freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+
+        if self._tactile_in_channels > 0 and self.config.freeze_tactile_backbone:
+            for param in self.tactile_backbone.parameters():
+                param.requires_grad = False
+
+        if self.config.use_tactile_raw_image and self.config.freeze_tactile_raw_backbone:
+            for param in self.tactile_raw_backbone.parameters():
+                param.requires_grad = False
 
         # =====================================================================
         # 4) Marker Displacement Encoder (MLP → independent 1D token)
@@ -362,7 +405,7 @@ class ACT(nn.Module):
             self.encoder_img_feat_input_proj = nn.Conv2d(
                 backbone_model.fc.in_features, config.dim_model, kernel_size=1
             )
-        if self.config.use_tactile_image_features:
+        if self._tactile_in_channels > 0:
             self.encoder_tac_feat_input_proj = nn.Conv2d(
                 tac_backbone_fc_in_features, config.dim_model, kernel_size=1
             )
@@ -387,7 +430,7 @@ class ACT(nn.Module):
         # 2D positional embeddings for camera and tactile image feature maps
         if self.config.image_features:
             self.encoder_cam_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
-        if self.config.use_tactile_image_features:
+        if self._tactile_in_channels > 0:
             self.encoder_tac_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
         if self.config.use_tactile_raw_image:
             self.encoder_tac_raw_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
@@ -535,21 +578,26 @@ class ACT(nn.Module):
                 encoder_in_tokens.extend(list(tac_raw_features))
                 encoder_in_pos_embed.extend(list(tac_raw_pos))
 
-        # 2D tokens: Tactile image features (depth + normal → 4ch)
-        if self.config.use_tactile_image_features and OBS_TAC_DEPTH in batch and OBS_TAC_NORMAL in batch:
-            # Data arrives as (B, H, W, C) float32, convert to (B, C, H, W)
-            tac_normal = batch[OBS_TAC_NORMAL].permute(0, 3, 1, 2).contiguous()  # (B, 3, H, W)
-            tac_depth = batch[OBS_TAC_DEPTH].permute(0, 3, 1, 2).contiguous()    # (B, 1, H, W)
-            # Fuse: normal (3ch) + depth (1ch) → 4 channels
-            tac_img = torch.cat([tac_normal, tac_depth], dim=1)  # (B, 4, H, W)
+        # 2D tokens: Tactile depth/normal image features (dynamic channels)
+        if self._tactile_in_channels > 0:
+            tac_channels = []
+            if self.config.use_tactile_normal and OBS_TAC_NORMAL in batch:
+                # (B, H, W, 3) → (B, 3, H, W)
+                tac_channels.append(batch[OBS_TAC_NORMAL].permute(0, 3, 1, 2).contiguous())
+            if self.config.use_tactile_depth and OBS_TAC_DEPTH in batch:
+                # (B, H, W, 1) → (B, 1, H, W)
+                tac_channels.append(batch[OBS_TAC_DEPTH].permute(0, 3, 1, 2).contiguous())
 
-            tac_features = self.tactile_backbone(tac_img)["feature_map"]  # (B, 512, H', W')
-            tac_pos_embed = self.encoder_tac_feat_pos_embed(tac_features).to(dtype=tac_features.dtype)
-            tac_features = self.encoder_tac_feat_input_proj(tac_features)  # (B, dim_model, H', W')
-            tac_features = einops.rearrange(tac_features, "b c h w -> (h w) b c")
-            tac_pos_embed = einops.rearrange(tac_pos_embed, "b c h w -> (h w) b c")
-            encoder_in_tokens.extend(list(tac_features))
-            encoder_in_pos_embed.extend(list(tac_pos_embed))
+            if tac_channels:
+                tac_img = torch.cat(tac_channels, dim=1)  # (B, C, H, W) where C=1/3/4
+
+                tac_features = self.tactile_backbone(tac_img)["feature_map"]
+                tac_pos_embed = self.encoder_tac_feat_pos_embed(tac_features).to(dtype=tac_features.dtype)
+                tac_features = self.encoder_tac_feat_input_proj(tac_features)
+                tac_features = einops.rearrange(tac_features, "b c h w -> (h w) b c")
+                tac_pos_embed = einops.rearrange(tac_pos_embed, "b c h w -> (h w) b c")
+                encoder_in_tokens.extend(list(tac_features))
+                encoder_in_pos_embed.extend(list(tac_pos_embed))
 
         # --- Stack and run through Transformer ---
         encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
