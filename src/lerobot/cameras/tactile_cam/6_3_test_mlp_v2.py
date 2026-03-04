@@ -493,7 +493,7 @@ def main():
     
     # 相机配置
     camera_config = TactileCameraConfig(
-        index_or_path="/dev/video4",
+        index_or_path="/dev/video2",
         fps=25,
         width=640,
         height=480,

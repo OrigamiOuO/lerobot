@@ -106,24 +106,23 @@ class SOFollower(Robot):
 
     @property
     def _tactile_ft(self) -> dict[str, tuple]:
-        """Tactile sensor features: depth, normal, and marker displacement for all tactile cameras."""
+        """Tactile sensor features: depth, normal, and marker displacement for all tactile cameras.
+        
+        Naming convention follows the camera pattern (observation.images.{cam_name}):
+            observation.tac_raw.{name}
+            observation.tac_depth.{name}
+            observation.tac_normal.{name}
+            observation.tac_marker_displacement.{name}
+        """
         if not self.tactile_cameras:
             return {}
         
         features = {}
         for name in self.tactile_cameras:
-            # For single legacy camera "tactile", use original names for backward compatibility
-            if name == "tactile" and len(self.tactile_cameras) == 1:
-                features["tactile_raw"] = (480, 640, 3)
-                features["tactile_depth"] = (480, 640, 1)
-                features["tactile_normal"] = (480, 640, 3)
-                features["marker_displacement"] = (self._num_markers, 2)
-            else:
-                # For multiple cameras, use prefixed names
-                features[f"{name}_raw"] = (480, 640, 3)
-                features[f"{name}_depth"] = (480, 640, 1)
-                features[f"{name}_normal"] = (480, 640, 3)
-                features[f"{name}_marker_displacement"] = (self._num_markers, 2)
+            features[f"tac_raw.{name}"] = (480, 640, 3)
+            features[f"tac_depth.{name}"] = (480, 640, 1)
+            features[f"tac_normal.{name}"] = (480, 640, 3)
+            features[f"tac_marker_displacement.{name}"] = (self._num_markers, 2)
         
         return features
 
@@ -352,13 +351,18 @@ class SOFollower(Robot):
         Read tactile sensor data from a single tactile camera using MLP model.
         
         Args:
-            name: Name of the tactile camera (e.g., "tactile", "left_finger", "right_finger")
+            name: Name of the tactile camera (user-defined in config, e.g., "tac1", "left", "right")
             tactile_cam: TactileCamera instance
             
         Returns:
-            dict with keys depending on camera name:
-            - For single camera "tactile": tactile_depth, tactile_normal, marker_displacement
-            - For multiple cameras: {name}_depth, {name}_normal, {name}_marker_displacement
+            dict with keys:
+                tac_raw.{name}                  → warped BGR frame (H, W, 3)
+                tac_depth.{name}                → depth map (H, W, 1)
+                tac_normal.{name}               → normal vectors (H, W, 3)
+                tac_marker_displacement.{name}  → marker displacements (N, 2)
+            
+            These become observation.tac_depth.{name} etc. in the dataset,
+            following the same convention as observation.images.{cam_name}.
         """
         import cv2
         
@@ -368,6 +372,7 @@ class SOFollower(Robot):
         
         # Read raw frame from tactile camera
         frame = tactile_cam.async_read(timeout_ms=200)
+        # async_read returns RGB; processor/tracker expect BGR (OpenCV convention)
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         
         h, w = frame_bgr.shape[:2]
@@ -379,14 +384,18 @@ class SOFollower(Robot):
                 frame_bgr, apply_warp=True
             )
             
-            # Get warped frame for marker tracking
-            warped_frame = processor.warp_perspective(frame_bgr)
+            # Get warped frame for marker tracking (BGR)
+            warped_frame_bgr = processor.warp_perspective(frame_bgr)
         else:
-            warped_frame = frame_bgr
+            warped_frame_bgr = frame_bgr
             raw_depth = np.zeros((h, w), dtype=np.float32)
             raw_normals = np.zeros((h, w, 3), dtype=np.float32)
         
-        h, w = warped_frame.shape[:2]
+        # Convert warped frame back to RGB for dataset storage
+        # (tac_raw is stored as observation.images.*, which expects RGB)
+        warped_frame_rgb = cv2.cvtColor(warped_frame_bgr, cv2.COLOR_BGR2RGB)
+        
+        h, w = warped_frame_bgr.shape[:2]
         
         # Initialize marker tracker on first valid frame (after background is collected)
         if not self._tactile_initialized.get(name, False) and processor is not None:
@@ -417,7 +426,7 @@ class SOFollower(Robot):
         # Update marker tracking and get displacements
         marker_displacement = np.zeros((self._num_markers, 2), dtype=np.float32)
         if tracker is not None and self._tactile_initialized.get(name, False):
-            tracker.update_markerMotion(warped_frame)
+            tracker.update_markerMotion(warped_frame_bgr)  # tracker expects BGR
             displacements = tracker.get_marker_displacements()
             if displacements is not None:
                 # Pad or truncate to match expected number of markers
@@ -427,21 +436,12 @@ class SOFollower(Robot):
                 mag = np.sqrt(marker_displacement[:, 0]**2 + marker_displacement[:, 1]**2)
                 marker_displacement[mag < self._marker_threshold] = 0.0
         
-        # Use appropriate key names based on whether this is single or multiple camera setup
-        if name == "tactile" and len(self.tactile_cameras) == 1:
-            return {
-                "tactile_raw": warped_frame,
-                "tactile_depth": depth,
-                "tactile_normal": normal,
-                "marker_displacement": marker_displacement,
-            }
-        else:
-            return {
-                f"{name}_raw": warped_frame,
-                f"{name}_depth": depth,
-                f"{name}_normal": normal,
-                f"{name}_marker_displacement": marker_displacement,
-            }
+        return {
+            f"tac_raw.{name}": warped_frame_rgb,
+            f"tac_depth.{name}": depth,
+            f"tac_normal.{name}": normal,
+            f"tac_marker_displacement.{name}": marker_displacement,
+        }
 
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
@@ -473,7 +473,16 @@ class SOFollower(Robot):
 
     @check_if_not_connected
     def disconnect(self):
-        self.bus.disconnect(self.config.disable_torque_on_disconnect)
+        try:
+            self.bus.disconnect(self.config.disable_torque_on_disconnect)
+        except RuntimeError as e:
+            logger.warning(f"Motor disconnect error (may be overloaded): {e}")
+            # Force release even if torque disable failed (e.g. gripper overload)
+            try:
+                self.bus.disconnect(disable_torque=False)
+            except Exception:
+                pass
+
         for cam in self.cameras.values():
             cam.disconnect()
         

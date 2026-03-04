@@ -291,6 +291,69 @@ class OpenCVCamera(Camera):
         else:
             self._validate_fps()
 
+        # Configure exposure and white balance via v4l2-ctl (Linux only)
+        self._configure_camera_controls()
+
+    def _configure_camera_controls(self) -> None:
+        """Configure camera exposure and white balance via v4l2-ctl (Linux only).
+
+        This ensures consistent camera settings between sessions, preventing issues
+        caused by residual v4l2 settings from previous camera usage (e.g. tactile
+        camera calibration scripts setting manual exposure on all cameras).
+        """
+        if platform.system() != "Linux":
+            return
+
+        if shutil.which("v4l2-ctl") is None:
+            logger.debug("v4l2-ctl not found, skipping camera control configuration")
+            return
+
+        device_path = self.index_or_path
+        if isinstance(device_path, int):
+            device_path = f"/dev/video{device_path}"
+        elif isinstance(device_path, Path):
+            device_path = str(device_path)
+
+        if not isinstance(device_path, str) or not device_path.startswith("/dev/video"):
+            return
+
+        # --- Exposure ---
+        if self.config.auto_exposure:
+            # auto_exposure=3 means Aperture Priority Mode (auto)
+            self._v4l2_set(device_path, "auto_exposure", "3")
+            logger.info(f"{self} auto exposure enabled")
+        else:
+            # auto_exposure=1 means Manual Mode
+            self._v4l2_set(device_path, "auto_exposure", "1")
+            if self.config.exposure is not None:
+                self._v4l2_set(device_path, "exposure_time_absolute", str(self.config.exposure))
+                logger.info(f"{self} manual exposure set to {self.config.exposure}")
+
+        # --- White Balance ---
+        if self.config.auto_wb:
+            self._v4l2_set(device_path, "white_balance_automatic", "1")
+            logger.info(f"{self} auto white balance enabled")
+        else:
+            self._v4l2_set(device_path, "white_balance_automatic", "0")
+            if self.config.wb_temperature is not None:
+                self._v4l2_set(device_path, "white_balance_temperature", str(self.config.wb_temperature))
+                logger.info(f"{self} white balance temperature set to {self.config.wb_temperature}K")
+
+    def _v4l2_set(self, device_path: str, control: str, value: str) -> bool:
+        """Set a v4l2 control value. Returns True on success."""
+        try:
+            result = subprocess.run(
+                ["v4l2-ctl", "-d", device_path, "-c", f"{control}={value}"],
+                check=False, capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                logger.warning(f"{self} failed to set {control}={value}: {result.stderr.strip()}")
+                return False
+            return True
+        except (subprocess.TimeoutExpired, Exception) as e:
+            logger.warning(f"{self} v4l2-ctl error setting {control}={value}: {e}")
+            return False
+
     def _validate_fps(self) -> None:
         """Validates and sets the camera's frames per second (FPS)."""
 

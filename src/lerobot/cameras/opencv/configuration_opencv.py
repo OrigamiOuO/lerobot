@@ -63,6 +63,18 @@ class OpenCVCameraConfig(CameraConfig):
     warmup_s: int = 1
     fourcc: str | None = None
 
+    # Exposure settings (Linux V4L2)
+    # auto_exposure=True (default): camera auto-adjusts exposure
+    # auto_exposure=False: use manual exposure with specified value
+    auto_exposure: bool = True
+    exposure: int | None = None
+
+    # White balance settings
+    # auto_wb=True (default): camera auto-adjusts white balance
+    # auto_wb=False: use manual white balance with specified temperature
+    auto_wb: bool = True
+    wb_temperature: int | None = None
+
     def __post_init__(self) -> None:
         if self.color_mode not in (ColorMode.RGB, ColorMode.BGR):
             raise ValueError(

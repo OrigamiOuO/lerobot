@@ -259,7 +259,7 @@ def main():
         dataset_path=dataset_path,
         model_save_dir=model_save_dir,
         n_epochs=100,
-        batch_size=2048,
+        batch_size=1024,
         learning_rate=0.001,
         train_ratio=0.8,
         device=None

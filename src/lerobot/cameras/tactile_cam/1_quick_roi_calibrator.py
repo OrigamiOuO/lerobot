@@ -241,7 +241,7 @@ def main():
     """主函数：仅初始化TactileCamera并运行"""
     # 配置TactileCamera（根据实际设备修改路径）
     camera_config = TactileCameraConfig(
-        index_or_path="/dev/video0",  # 替换为你的TactileCamera设备路径
+        index_or_path="/dev/video2",  # 替换为你的TactileCamera设备路径
         fps=25,
         width=640,
         height=480,

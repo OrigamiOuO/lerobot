@@ -101,7 +101,7 @@ def image2bgrxys(image: np.ndarray) -> np.ndarray:
 class MLPDataCollectorV2(BaseProcessor):
     """MLP训练数据收集器 (v2 - 与gs_sdk一致)"""
     
-    def __init__(self, ball_radius_mm: float = 4.0, ppmm: float = 19.6,
+    def __init__(self, ball_radius_mm: float = 4.0, ppmm: float = 20.20,
                  pad: int = 20, calib_file: str = None, has_marker: bool = True):
         """
         初始化数据收集器
@@ -303,7 +303,7 @@ class MLPDataCollectorV2(BaseProcessor):
         }
 
 
-def process_existing_data(data_dir: str, ppmm: float = 19.6, ball_radius_mm: float = 4.0,
+def process_existing_data(data_dir: str, ppmm: float = 20.20, ball_radius_mm: float = 4.0,
                           has_marker: bool = True, radius_reduction: float = 4.0,
                           use_labels: bool = True):
     """
@@ -438,7 +438,7 @@ def process_existing_data(data_dir: str, ppmm: float = 19.6, ball_radius_mm: flo
     }
 
 
-def realtime_capture(save_dir: str, ppmm: float = 19.6, ball_radius_mm: float = 4.0,
+def realtime_capture(save_dir: str, ppmm: float = 20.20, ball_radius_mm: float = 4.0,
                      has_marker: bool = False, calib_file: str = None):
     """
     实时连接相机采集标定数据
@@ -454,7 +454,7 @@ def realtime_capture(save_dir: str, ppmm: float = 19.6, ball_radius_mm: float = 
     
     # 相机配置
     camera_config = TactileCameraConfig(
-        index_or_path="/dev/video0",
+        index_or_path="/dev/video2",
         fps=25,
         width=640,
         height=480,
@@ -637,7 +637,7 @@ def main():
         PPMM = 1.0 / mm_per_pixel  # 转换为 pixel per mm
         print(f"[INFO] 加载 mm_per_pixel: {mm_per_pixel:.4f}, ppmm: {PPMM:.2f}")
     else:
-        PPMM = 19.6  # 默认值 (GelSight Mini)
+        PPMM = 20.20  # 默认值 (GelSight Mini)
         print(f"[WARNING] 使用默认 ppmm: {PPMM:.2f}")
     
     print("\n" + "=" * 60)
