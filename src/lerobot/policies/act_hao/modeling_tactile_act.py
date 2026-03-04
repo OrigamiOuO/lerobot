@@ -16,7 +16,8 @@
 """Tactile Action Chunking Transformer Policy (Hao variant)
 
 Based on ACT (https://huggingface.co/papers/2304.13705) with GelSight tactile sensor integration.
-Supports three tactile modalities:
+Supports four tactile modalities:
+  - Raw tactile RGB image (3ch) → dedicated ResNet backbone (unfrozen BN)
   - Depth map (1ch) + Normal map (3ch) → fused 4-channel ResNet backbone (unfrozen BN)
   - Marker displacement (35×2) → independent 1D token via MLP encoder
 """
@@ -41,16 +42,17 @@ from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 
 # Constants for tactile observation keys (must match dataset info.json keys)
-OBS_TAC_DEPTH = "observation.tac1_depth"
-OBS_TAC_NORMAL = "observation.tac1_normal"
-OBS_TAC_MARKER = "observation.tac1_marker_displacement"
+OBS_TAC_DEPTH = "observation.tac_depth.tac1"
+OBS_TAC_NORMAL = "observation.tac_normal.tac1"
+OBS_TAC_MARKER = "observation.tac_marker_displacement.tac1"
+OBS_TAC_RAW = "observation.images.tac_raw.tac1"
 
 
 class TactileACTPolicy(PreTrainedPolicy):
     """Tactile ACT Policy with GelSight tactile sensor support.
 
-    Processes camera images, tactile depth+normal images, marker displacement,
-    and robot proprioceptive state to predict action chunks.
+    Processes camera images, raw tactile RGB images, tactile depth+normal images,
+    marker displacement, and robot proprioceptive state to predict action chunks.
     """
 
     config_class = TactileACTConfig
@@ -81,6 +83,7 @@ class TactileACTPolicy(PreTrainedPolicy):
                     for n, p in self.named_parameters()
                     if not n.startswith("model.backbone")
                     and not n.startswith("model.tactile_backbone")
+                    and not n.startswith("model.tactile_raw_backbone")
                     and p.requires_grad
                 ]
             },
@@ -99,6 +102,14 @@ class TactileACTPolicy(PreTrainedPolicy):
                     if n.startswith("model.tactile_backbone") and p.requires_grad
                 ],
                 "lr": self.config.optimizer_lr_tactile_backbone,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in self.named_parameters()
+                    if n.startswith("model.tactile_raw_backbone") and p.requires_grad
+                ],
+                "lr": self.config.optimizer_lr_tactile_raw_backbone,
             },
         ]
 
@@ -205,24 +216,26 @@ class ACT(nn.Module):
                                  Transformer
                                  Used alone for inference
                                  (acts as VAE decoder during training)
-                                ┌─────────────────────────────┐
-                                │                Outputs      │
-                                │                   ▲         │
-                                │        ┌─────►┌───────┐    │
-                   ┌──────┐     │        │      │Transf.│    │
-                   │      │     │        ├─────►│decoder│    │
-              ┌────┴────┐ │     │        │      │       │    │
-              │         │ │     │ ┌──────┴──┬──►│       │    │
-              │ VAE     │ │     │ │         │   └───────┘    │
-              │ encoder │ │     │ │ Transf. │                │
-              │         │ │     │ │ encoder │                │
-              └───▲─────┘ │     │ │         │                │
-                  │       │     │ └▲──▲─▲─▲─┘                │
-                  │       │     │  │  │ │ │                  │
-                inputs    └─────┼──┘  │ │ tactile img emb.   │
-                                │    │ marker emb.           │
-                                │   state emb.               │
-                                └─────────────────────────────┘
+                                ┌──────────────────────────────────┐
+                                │                Outputs           │
+                                │                   ▲              │
+                                │        ┌─────►┌───────┐         │
+                   ┌──────┐     │        │      │Transf.│         │
+                   │      │     │        ├─────►│decoder│         │
+              ┌────┴────┐ │     │        │      │       │         │
+              │         │ │     │ ┌──────┴──┬──►│       │         │
+              │ VAE     │ │     │ │         │   └───────┘         │
+              │ encoder │ │     │ │ Transf. │                     │
+              │         │ │     │ │ encoder │                     │
+              └───▲─────┘ │     │ │         │                     │
+                  │       │     │ └▲──▲─▲─▲─▲──▲─┘                │
+                  │       │     │  │  │ │ │ │  │                  │
+                inputs    └─────┼──┘  │ │ │ │  tac_raw img emb.  │
+                                │    │ │ │ tac depth+normal emb. │
+                                │    │ │ marker emb.             │
+                                │   │ state emb.                 │
+                                │  cam img emb.                  │
+                                └──────────────────────────────────┘
     """
 
     def __init__(self, config: TactileACTConfig):
@@ -299,6 +312,22 @@ class ACT(nn.Module):
             )
 
         # =====================================================================
+        # 3b) Tactile Raw Image Backbone (3-channel ResNet, unfrozen BN)
+        #     Processes the raw GelSight RGB image directly.
+        #     BatchNorm is NOT frozen → fully fine-tuned during training.
+        # =====================================================================
+        if self.config.use_tactile_raw_image:
+            tac_raw_backbone_model = getattr(torchvision.models, config.tactile_raw_vision_backbone)(
+                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+                weights=config.pretrained_tactile_raw_backbone_weights,
+                # No norm_layer override → default nn.BatchNorm2d (fully trainable)
+            )
+            tac_raw_backbone_fc_in_features = tac_raw_backbone_model.fc.in_features
+            self.tactile_raw_backbone = IntermediateLayerGetter(
+                tac_raw_backbone_model, return_layers={"layer4": "feature_map"}
+            )
+
+        # =====================================================================
         # 4) Marker Displacement Encoder (MLP → independent 1D token)
         #    Input: (B, 35, 2) → flatten → (B, 70) → MLP → (B, dim_model)
         # =====================================================================
@@ -337,6 +366,10 @@ class ACT(nn.Module):
             self.encoder_tac_feat_input_proj = nn.Conv2d(
                 tac_backbone_fc_in_features, config.dim_model, kernel_size=1
             )
+        if self.config.use_tactile_raw_image:
+            self.encoder_tac_raw_feat_input_proj = nn.Conv2d(
+                tac_raw_backbone_fc_in_features, config.dim_model, kernel_size=1
+            )
 
         # =====================================================================
         # 7) Positional Embeddings
@@ -356,6 +389,8 @@ class ACT(nn.Module):
             self.encoder_cam_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
         if self.config.use_tactile_image_features:
             self.encoder_tac_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
+        if self.config.use_tactile_raw_image:
+            self.encoder_tac_raw_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
 
         # =====================================================================
         # 8) Decoder
@@ -378,9 +413,10 @@ class ACT(nn.Module):
             batch: Dictionary with keys:
                 - "observation.state": (B, state_dim)
                 - "observation.images.*": (B, C, H, W) per camera (via OBS_IMAGES list)
-                - "observation.tac1_depth": (B, H, W, 1) depth map
-                - "observation.tac1_normal": (B, H, W, 3) normal map
-                - "observation.tac1_marker_displacement": (B, 35, 2) marker positions
+                - "observation.tac_depth.tac1": (B, H, W, 1) depth map
+                - "observation.tac_normal.tac1": (B, H, W, 3) normal map
+                - "observation.tac_marker_displacement.tac1": (B, 35, 2) marker positions
+                - "observation.images.tac_raw.tac1": (B, C, H, W) raw tactile RGB image
                 - "action": (B, chunk_size, action_dim) [only during training with VAE]
 
         Returns:
@@ -448,7 +484,7 @@ class ACT(nn.Module):
             latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(device)
 
         # --- Build Transformer Encoder Input Tokens ---
-        # Token order: [latent, (state), (marker), (env), (*cam_pixels), (*tac_pixels)]
+        # Token order: [latent, (state), (marker), (env), (*cam_pixels), (*tac_raw_pixels), (*tac_depth_normal_pixels)]
         encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
         encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
 
@@ -466,9 +502,16 @@ class ACT(nn.Module):
         if self.config.env_state_feature:
             encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
 
-        # 2D tokens: Camera image features
+        # 2D tokens: Camera image features (excluding raw tactile image, which has its own backbone)
         if self.config.image_features:
-            for img in batch[OBS_IMAGES]:
+            tac_raw_key = self.config.tactile_raw_image_key if self.config.use_tactile_raw_image else None
+            cam_image_keys = [k for k in self.config.image_features if k != tac_raw_key]
+            # OBS_IMAGES list corresponds to self.config.image_features keys in order;
+            # we need to pick only the camera images (skip tac_raw)
+            all_image_keys = list(self.config.image_features.keys())
+            for idx, img in enumerate(batch[OBS_IMAGES]):
+                if all_image_keys[idx] == tac_raw_key:
+                    continue  # handled by tactile_raw_backbone below
                 cam_features = self.backbone(img)["feature_map"]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
@@ -476,6 +519,21 @@ class ACT(nn.Module):
                 cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
                 encoder_in_tokens.extend(list(cam_features))
                 encoder_in_pos_embed.extend(list(cam_pos_embed))
+
+        # 2D tokens: Tactile raw image features (3ch RGB → dedicated ResNet)
+        if self.config.use_tactile_raw_image and self.config.image_features:
+            tac_raw_key = self.config.tactile_raw_image_key
+            all_image_keys = list(self.config.image_features.keys())
+            if tac_raw_key in all_image_keys:
+                tac_raw_idx = all_image_keys.index(tac_raw_key)
+                tac_raw_img = batch[OBS_IMAGES][tac_raw_idx]  # (B, C, H, W)
+                tac_raw_features = self.tactile_raw_backbone(tac_raw_img)["feature_map"]
+                tac_raw_pos = self.encoder_tac_raw_feat_pos_embed(tac_raw_features).to(dtype=tac_raw_features.dtype)
+                tac_raw_features = self.encoder_tac_raw_feat_input_proj(tac_raw_features)
+                tac_raw_features = einops.rearrange(tac_raw_features, "b c h w -> (h w) b c")
+                tac_raw_pos = einops.rearrange(tac_raw_pos, "b c h w -> (h w) b c")
+                encoder_in_tokens.extend(list(tac_raw_features))
+                encoder_in_pos_embed.extend(list(tac_raw_pos))
 
         # 2D tokens: Tactile image features (depth + normal → 4ch)
         if self.config.use_tactile_image_features and OBS_TAC_DEPTH in batch and OBS_TAC_NORMAL in batch:

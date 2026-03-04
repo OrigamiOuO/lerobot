@@ -77,6 +77,14 @@ class TactileACTConfig(PreTrainedConfig):
     tactile_vision_backbone: str = "resnet18"
     pretrained_tactile_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
 
+    # Tactile raw RGB image features: 3ch ResNet (unfrozen BN).
+    # The raw tactile image is processed by a dedicated backbone, separate from camera images.
+    use_tactile_raw_image: bool = True
+    tactile_raw_image_key: str = "observation.images.tac_raw.tac1"
+    tactile_raw_vision_backbone: str = "resnet18"
+    pretrained_tactile_raw_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
+    optimizer_lr_tactile_raw_backbone: float = 1e-5
+
     # Tactile marker displacement features: (35, 2) → flatten → MLP → independent token.
     use_tactile_marker: bool = True
     tactile_marker_input_dim: int = 70   # 35 markers * 2 (x, y)
@@ -123,6 +131,10 @@ class TactileACTConfig(PreTrainedConfig):
         if self.use_tactile_image_features and not self.tactile_vision_backbone.startswith("resnet"):
             raise ValueError(
                 f"`tactile_vision_backbone` must be one of the ResNet variants. Got {self.tactile_vision_backbone}."
+            )
+        if self.use_tactile_raw_image and not self.tactile_raw_vision_backbone.startswith("resnet"):
+            raise ValueError(
+                f"`tactile_raw_vision_backbone` must be one of the ResNet variants. Got {self.tactile_raw_vision_backbone}."
             )
         if self.temporal_ensemble_coeff is not None and self.n_action_steps > 1:
             raise NotImplementedError(
