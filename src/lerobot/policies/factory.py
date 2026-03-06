@@ -35,6 +35,7 @@ from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.tactile_act.configuration_tactile_act import TactileACTConfig
+from lerobot.policies.act_hao.configuration_act_hao import ACTHaoConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
@@ -144,6 +145,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.tactile_act.modeling_tactile_act import TactileACTPolicy
 
         return TactileACTPolicy
+    elif name == "act_hao":
+        from lerobot.policies.act_hao.modeling_act_hao import ACTHaoPolicy
+
+        return ACTHaoPolicy
     else:
         try:
             return _get_policy_cls_from_policy_name(name=name)
@@ -194,6 +199,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return XVLAConfig(**kwargs)
     elif policy_type == "wall_x":
         return WallXConfig(**kwargs)
+    elif policy_type == "act_hao":
+        return ACTHaoConfig(**kwargs)
     else:
         try:
             config_cls = PreTrainedConfig.get_choice_class(policy_type)
@@ -326,6 +333,14 @@ def make_pre_post_processors(
         from lerobot.policies.tactile_act.processor_tactile_act import make_tactile_act_pre_post_processors
 
         processors = make_tactile_act_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, ACTHaoConfig):
+        from lerobot.policies.act_hao.processor_act_hao import make_act_hao_pre_post_processors
+
+        processors = make_act_hao_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
