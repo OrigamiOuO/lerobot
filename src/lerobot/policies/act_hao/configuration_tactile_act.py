@@ -20,7 +20,7 @@ from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
 
 
-@PreTrainedConfig.register_subclass("tactile_act_hao")
+@PreTrainedConfig.register_subclass("act_hao")
 @dataclass
 class TactileACTConfig(PreTrainedConfig):
     """Configuration class for Tactile ACT policy with GelSight tactile sensor support.

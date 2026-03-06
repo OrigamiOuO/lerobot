@@ -41,9 +41,9 @@ from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 
 # Constants for tactile observation keys (must match dataset info.json keys)
-OBS_TAC_DEPTH = "observation.tac1_depth"
-OBS_TAC_NORMAL = "observation.tac1_normal"
-OBS_TAC_MARKER = "observation.tac1_marker_displacement"
+OBS_TAC_DEPTH = "observation.tac_depth.tac1"
+OBS_TAC_NORMAL = "observation.tac_normal.tac1"
+OBS_TAC_MARKER = "observation.tac_marker_displacement.tac1"
 
 
 class TactileACTPolicy(PreTrainedPolicy):
@@ -54,7 +54,7 @@ class TactileACTPolicy(PreTrainedPolicy):
     """
 
     config_class = TactileACTConfig
-    name = "tactile_act_hao"
+    name = "act_hao"
 
     def __init__(
         self,
