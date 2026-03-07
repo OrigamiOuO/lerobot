@@ -47,7 +47,7 @@ from lerobot.cameras.configs import ColorMode, Cv2Rotation
 # 可视化辅助
 # ──────────────────────────────────────────────────────────────
 
-def draw_marker_arrows(frame: np.ndarray, tracker: GelSightMarkerTracker, scale: float = 6.0, threshold: float = 6) -> np.ndarray:
+def draw_marker_arrows(frame: np.ndarray, tracker: GelSightMarkerTracker, scale: float = 6.0, threshold: float = 0.5) -> np.ndarray:
     """在帧上绘制 marker 位移箭头，小于 threshold 的位移视为静止"""
     vis = frame.copy()
     if tracker.flowcenter is None or len(tracker.flowcenter) == 0:
@@ -88,14 +88,14 @@ def draw_marker_arrows(frame: np.ndarray, tracker: GelSightMarkerTracker, scale:
 
 def main():
     parser = argparse.ArgumentParser(description="触觉传感器实时测试")
-    parser.add_argument("--device", type=str, default="/dev/video2", help="相机设备路径")
+    parser.add_argument("--device", type=str, default="/dev/video4", help="相机设备路径")
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=25, help="相机帧率")
     parser.add_argument("--exposure", type=int, default=600)
     parser.add_argument("--wb", type=int, default=4000, help="白平衡色温")
     parser.add_argument("--num-markers", type=int, default=35, help="marker 数量")
-    parser.add_argument("--threshold", type=float, default=1, help="marker 位移阈值 (像素), 低于此值视为噪声归零")
+    parser.add_argument("--threshold", type=float, default=5, help="marker 位移阈值 (像素), 低于此值视为噪声归零")
     parser.add_argument("--save-dir", type=str, default=None, help="保存目录 (默认 outputs/tactile_test)")
     args = parser.parse_args()
 
