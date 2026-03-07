@@ -179,6 +179,7 @@ outputs/
 *.part
 
 # Dataset folders
+datasets
 datasets/
 hao_datasets/
 
