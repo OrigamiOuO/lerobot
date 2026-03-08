@@ -45,8 +45,8 @@ class ACTHaoConfig(PreTrainedConfig):
 
     # Input / output structure.
     n_obs_steps: int = 1
-    chunk_size: int = 100
-    n_action_steps: int = 100
+    chunk_size: int = 20
+    n_action_steps: int = 10
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -72,14 +72,14 @@ class ACTHaoConfig(PreTrainedConfig):
     pre_norm: bool = False
     dim_model: int = 512
     n_heads: int = 8
-    dim_feedforward: int = 3200
+    dim_feedforward: int = 2048
     feedforward_activation: str = "relu"
     n_encoder_layers: int = 4
     n_decoder_layers: int = 1
 
     # VAE.
     use_vae: bool = True
-    latent_dim: int = 32
+    latent_dim: int = 8
     n_vae_encoder_layers: int = 4
 
     # Inference.
@@ -87,10 +87,10 @@ class ACTHaoConfig(PreTrainedConfig):
 
     # Training and loss computation.
     dropout: float = 0.1
-    kl_weight: float = 10.0
+    kl_weight: float = 1e-4
 
     # Training preset.
-    optimizer_lr: float = 1e-5
+    optimizer_lr: float = 1e-4
     optimizer_weight_decay: float = 1e-4
     optimizer_lr_backbone: float = 1e-5
 
