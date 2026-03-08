@@ -268,8 +268,8 @@ class SOFollower(Robot):
                 self.bus.write("D_Coefficient", motor, 32)
 
                 if motor == "gripper":
-                    self.bus.write("Max_Torque_Limit", motor, 500)  # 50% of max torque to avoid burnout
-                    self.bus.write("Protection_Current", motor, 250)  # 50% of max current to avoid burnout
+                    self.bus.write("Max_Torque_Limit", motor, 700)  # 50% of max torque to avoid burnout
+                    self.bus.write("Protection_Current", motor, 350)  # 50% of max current to avoid burnout
                     self.bus.write("Overload_Torque", motor, 25)  # 25% torque when overloaded
 
     def setup_motors(self) -> None:
@@ -387,8 +387,8 @@ class SOFollower(Robot):
             warped_frame_bgr = processor.warp_perspective(frame_bgr)
         else:
             warped_frame_bgr = frame_bgr
-            raw_depth = np.zeros((h, w), dtype=np.float32)
-            raw_normals = np.zeros((h, w, 3), dtype=np.float32)
+            raw_depth = np.zeros((h, w), dtype=np.float16)
+            raw_normals = np.zeros((h, w, 3), dtype=np.float16)
         
         # Convert warped frame back to RGB for dataset storage
         # (tac_raw is stored as observation.images.*, which expects RGB)

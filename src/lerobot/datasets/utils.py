@@ -689,9 +689,11 @@ def hw_to_dataset_features(
         }
 
     # Non-RGB 3D arrays (H, W, C) where C != 3, e.g., depth (H,W,1), normals (H,W,2)
+    # Large arrays (H*W > 1000) use float16 to halve parquet storage size
     for key, shape in array_3d_fts.items():
+        is_large = len(shape) >= 2 and shape[0] * shape[1] > 1000
         features[f"{prefix}.{key}"] = {
-            "dtype": "float32",
+            "dtype": "float16" if is_large else "float32",
             "shape": shape,
             "names": None,
         }
@@ -738,6 +740,10 @@ def build_dataset_frame(
                 # Examples: tactile_fsr (12,), marker_displacement (N,2), depth (H,W,1), normals (H,W,2)
                 short_key = key.removeprefix(f"{prefix}.")
                 frame[key] = np.array(values[short_key], dtype=np.float32)
+        elif ft["dtype"] == "float16":
+            # Large arrays stored as float16 to save space (e.g. tac_depth, tac_normal)
+            short_key = key.removeprefix(f"{prefix}.")
+            frame[key] = np.array(values[short_key], dtype=np.float16)
         elif ft["dtype"] in ["image", "video"]:
             frame[key] = values[key.removeprefix(f"{prefix}.images.")]
 
