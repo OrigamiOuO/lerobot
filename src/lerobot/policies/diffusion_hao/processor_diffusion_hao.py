@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 
-# Copyright 2024 Tony Z. Zhao and The HuggingFace Inc. team. All rights reserved.
+# Copyright 2024 Columbia Artificial Intelligence, Robotics Lab,
+# and The HuggingFace Inc. team. All rights reserved.
+# Modified for Diffusion-Hao tactile adaptation.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,11 +15,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Processor for Diffusion-Hao policy."""
+
 from typing import Any
 
 import torch
 
-from lerobot.policies.tactile_act.configuration_tactile_act import TactileACTConfig
+from lerobot.policies.diffusion_hao.configuration_diffusion_hao import DiffusionHaoConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -31,26 +35,34 @@ from lerobot.processor.converters import policy_action_to_transition, transition
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 
-def make_tactile_act_pre_post_processors(
-    config: TactileACTConfig,
+def make_diffusion_hao_pre_post_processors(
+    config: DiffusionHaoConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
-    """Creates the pre- and post-processing pipelines for the ACT policy.
+    """
+    Constructs pre-processor and post-processor pipelines for diffusion-hao policy.
 
-    The pre-processing pipeline handles normalization, batching, and device placement for the model inputs.
-    The post-processing pipeline handles unnormalization and moves the model outputs back to the CPU.
+    The pre-processing pipeline prepares the input data for the model by:
+    1. Renaming features.
+    2. Normalizing the input and output features based on dataset statistics.
+    3. Adding a batch dimension.
+    4. Moving the data to the specified device.
+
+    The post-processing pipeline handles the model's output by:
+    1. Moving the data to the CPU.
+    2. Unnormalizing the output features to their original scale.
 
     Args:
-        config (TactileACTConfig): The ACT policy configuration object.
-        dataset_stats (dict[str, dict[str, torch.Tensor]] | None): A dictionary containing dataset
-            statistics (e.g., mean and std) used for normalization. Defaults to None.
+        config: The configuration object for the diffusion-hao policy,
+            containing feature definitions, normalization mappings, and device information.
+        dataset_stats: A dictionary of statistics used for normalization.
+            Defaults to None.
 
     Returns:
-        tuple[PolicyProcessorPipeline[dict[str, Any], dict[str, Any]], PolicyProcessorPipeline[PolicyAction, PolicyAction]]: A tuple containing the
-        pre-processor pipeline and the post-processor pipeline.
+        A tuple containing the configured pre-processor and post-processor pipelines.
     """
 
     input_steps = [
@@ -61,7 +73,6 @@ def make_tactile_act_pre_post_processors(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
-            device=config.device,
         ),
     ]
     output_steps = [
@@ -70,7 +81,6 @@ def make_tactile_act_pre_post_processors(
         ),
         DeviceProcessorStep(device="cpu"),
     ]
-
     return (
         PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
             steps=input_steps,
