@@ -98,7 +98,7 @@ def aggregate_pipeline_dataset_features(
     images_token = OBS_IMAGES.split(".")[-1]
 
     # Names that indicate non-image array data (tactile, depth, normal, etc.)
-    non_image_keywords = ("tactile", "depth", "normal", "displacement", "force", "pressure")
+    non_image_keywords = ("displacement", "force", "pressure")
 
     # Iterate through all features transformed by the pipeline.
     for ptype, feats in all_features.items():

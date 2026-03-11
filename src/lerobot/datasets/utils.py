@@ -649,7 +649,7 @@ def hw_to_dataset_features(
     array_2d_fts = {}  # 2D arrays like marker displacements (N, 2)
     
     # Names that indicate non-image array data (tactile, depth, normal, etc.)
-    non_image_keywords = ("tactile", "depth", "normal", "displacement", "force", "pressure")
+    non_image_keywords = ("displacement", "force", "pressure")
     
     for key, shape in hw_features.items():
         if not isinstance(shape, tuple):

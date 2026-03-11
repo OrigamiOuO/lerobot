@@ -120,7 +120,7 @@ class SOFollower(Robot):
         features = {}
         for name in self.tactile_cameras:
             features[f"tac_raw.{name}"] = (480, 640, 3)
-            features[f"tac_depth.{name}"] = (480, 640, 1)
+            features[f"tac_depth.{name}"] = (480, 640, 3)
             features[f"tac_normal.{name}"] = (480, 640, 3)
             features[f"tac_marker_displacement.{name}"] = (self._num_markers, 2)
         
@@ -176,7 +176,6 @@ class SOFollower(Robot):
             # Load ppmm from calibration file
             mm_per_pixel_file = os.path.join(tactile_cam_dir, "calibration_data", "mm_per_pixel.npz")
             if os.path.exists(mm_per_pixel_file):
-                import numpy as np
                 data = np.load(mm_per_pixel_file)
                 mm_per_pixel = float(data['mm_per_pixel'])
                 ppmm = 1.0 / mm_per_pixel
@@ -410,18 +409,23 @@ class SOFollower(Robot):
                 # No tracker, mark as initialized anyway
                 self._tactile_initialized[name] = True
         
-        # Convert depth to (H, W, 1) format
-        # raw_depth is (H, W) where each pixel value is the depth at that point
+        # Convert depth to uint8 (H, W, 3) for video storage.
+        # raw_depth is (H, W) in mm; clip to [0, TAC_DEPTH_MAX_MM] then map to [0, 255].
+        # Repeated across 3 channels to satisfy RGB video format.
+        TAC_DEPTH_MAX_MM = 3.0
         if raw_depth is not None:
-            depth = raw_depth[..., np.newaxis].astype(np.float32)  # (H, W, 1)
+            depth_u8 = np.clip(raw_depth / TAC_DEPTH_MAX_MM, 0.0, 1.0)
+            depth_u8 = (depth_u8 * 255).astype(np.uint8)  # (H, W)
+            depth = np.stack([depth_u8, depth_u8, depth_u8], axis=-1)  # (H, W, 3)
         else:
-            depth = np.zeros((h, w, 1), dtype=np.float32)
-        
-        # Normal vectors are already (H, W, 3) with (nx, ny, nz) components
+            depth = np.zeros((h, w, 3), dtype=np.uint8)
+
+        # Convert normal vectors (H, W, 3) from [-1, 1] to uint8 [0, 255].
+        # Inverse mapping at training time: normal_float = pixel / 127.5 - 1.0
         if raw_normals is not None and raw_normals.shape[-1] == 3:
-            normal = raw_normals.astype(np.float32)  # (H, W, 3)
+            normal = np.clip((raw_normals + 1.0) * 127.5, 0, 255).astype(np.uint8)  # (H, W, 3)
         else:
-            normal = np.zeros((h, w, 3), dtype=np.float32)
+            normal = np.zeros((h, w, 3), dtype=np.uint8)
         
         # Update marker tracking and get displacements
         marker_displacement = np.zeros((self._num_markers, 2), dtype=np.float32)
