@@ -608,7 +608,8 @@ class MLPProcessor(BaseProcessor):
     """
     
     def __init__(self, model_path: str = None, pad: int = 20, 
-                 calib_file: str = None, device: str = None, ppmm: float = 7.6):
+                 calib_file: str = None, device: str = None, ppmm: float = 7.6,
+                 blur_ksize: int = 5):
         """
         初始化处理器
         
@@ -618,10 +619,15 @@ class MLPProcessor(BaseProcessor):
             calib_file: 透视变换矩阵文件路径
             device: 计算设备 ('cuda' 或 'cpu')
             ppmm: 像素每毫米
+            blur_ksize: 高斯模糊核大小 (奇数, 0=关闭降噪)
         """
         super().__init__(pad=pad, calib_file=calib_file)
         
         self.ppmm = ppmm
+        # 高斯模糊核大小 (必须为奇数)
+        if blur_ksize > 0 and blur_ksize % 2 == 0:
+            blur_ksize += 1
+        self.blur_ksize = blur_ksize
         
         # 延迟导入torch
         try:
@@ -816,7 +822,14 @@ class MLPProcessor(BaseProcessor):
         # 泊松重建深度
         depth = _poisson_dct_neumann(G[:, :, 0], G[:, :, 1]).astype(np.float32)
         
-        # 计算法向量
+        # 高斯模糊降噪 (对深度和梯度同时滤波)
+        if self.blur_ksize > 0:
+            ksize = (self.blur_ksize, self.blur_ksize)
+            depth = cv2.GaussianBlur(depth, ksize, 0)
+            G[:, :, 0] = cv2.GaussianBlur(G[:, :, 0], ksize, 0)
+            G[:, :, 1] = cv2.GaussianBlur(G[:, :, 1], ksize, 0)
+        
+        # 计算法向量 (在模糊后的梯度上计算，噪声更小)
         normals = self._compute_normals(G)
         
         # 可视化

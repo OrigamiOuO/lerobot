@@ -91,11 +91,12 @@ def main():
     parser.add_argument("--device", type=str, default="/dev/video4", help="相机设备路径")
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
-    parser.add_argument("--fps", type=int, default=25, help="相机帧率")
+    parser.add_argument("--fps", type=int, default=30, help="相机帧率")
     parser.add_argument("--exposure", type=int, default=600)
     parser.add_argument("--wb", type=int, default=4000, help="白平衡色温")
     parser.add_argument("--num-markers", type=int, default=35, help="marker 数量")
-    parser.add_argument("--threshold", type=float, default=5, help="marker 位移阈值 (像素), 低于此值视为噪声归零")
+    parser.add_argument("--threshold", type=float, default=0.5, help="marker 位移阈值 (像素), 低于此值视为噪声归零")
+    parser.add_argument("--blur", type=int, default=5, help="高斯模糊核大小 (奇数, 0=关闭降噪, 默认5)")
     parser.add_argument("--save-dir", type=str, default=None, help="保存目录 (默认 outputs/tactile_test)")
     args = parser.parse_args()
 
@@ -137,6 +138,7 @@ def main():
         pad=20,
         calib_file=calib_file if os.path.exists(calib_file) else None,
         ppmm=ppmm,
+        blur_ksize=args.blur,
     )
     tracker = GelSightMarkerTracker()
     tracker.IsDisplay = False

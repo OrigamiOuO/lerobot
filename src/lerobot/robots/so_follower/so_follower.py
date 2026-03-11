@@ -447,6 +447,27 @@ class SOFollower(Robot):
             f"tac_marker_displacement.{name}": marker_displacement,
         }
 
+    def reset_tactile(self):
+        """Reset all tactile processors and marker trackers for new episode.
+
+        After calling this, the processors will re-collect background frames.
+        Call `get_observation()` repeatedly until `tactile_ready` is True
+        before starting to record.
+        """
+        for name, processor in self.tactile_processors.items():
+            processor.reset()
+            self._tactile_initialized[name] = False
+        logger.info("All tactile sensors reset, collecting new background...")
+
+    @property
+    def tactile_ready(self) -> bool:
+        """True when all tactile processors have finished background collection."""
+        if not self.tactile_processors:
+            return True
+        return all(
+            not proc.con_flag for proc in self.tactile_processors.values()
+        )
+
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
         """Command arm to move to a target joint configuration.
