@@ -284,6 +284,12 @@ class LookupTableProcessor(BaseProcessor):
         normal_z = 1.0 / denom
         raw_normals = np.stack([normal_x, normal_y, normal_z], axis=-1)
         
+        # 法向量噪声门限：梯度幅值小于阈值时，强制法向量为 (0, 0, 1)
+        GRAD_NOISE_THRESHOLD = 0.02
+        grad_mag = np.sqrt(grad_x**2 + grad_y**2)
+        no_contact_mask = grad_mag < GRAD_NOISE_THRESHOLD
+        raw_normals[no_contact_mask] = np.array([0.0, 0.0, 1.0])
+        
         # 法向量可视化（强力增强对比度）
         # 放大 x, y 分量以增强可视化效果
         normal_x_enhanced = np.clip(raw_normals[:, :, 0] * 8.0, -1, 1)
@@ -300,11 +306,17 @@ class LookupTableProcessor(BaseProcessor):
         raw_depth = raw_depth - depth_min
         raw_depth[raw_depth < 0] = 0
         
-        # 深度可视化
+        # 深度噪声门限：小于阈值的深度值归零
+        DEPTH_NOISE_THRESHOLD = 0.05
+        raw_depth[raw_depth < DEPTH_NOISE_THRESHOLD] = 0.0
+        
+        # 深度可视化 - 使用固定范围避免帧间闪烁
         depth_denoised = cv2.bilateralFilter(raw_depth.astype(np.float32), d=9, 
                                              sigmaColor=75, sigmaSpace=75)
-        depth_normalized = cv2.normalize(depth_denoised, None, 0, 255, cv2.NORM_MINMAX)
-        depth_colored = cv2.applyColorMap(depth_normalized.astype(np.uint8), cv2.COLORMAP_VIRIDIS)
+        TAC_DEPTH_VIS_MAX = 3.0  # 固定可视化范围
+        depth_clipped = np.clip(depth_denoised, 0.0, TAC_DEPTH_VIS_MAX)
+        depth_vis_u8 = (depth_clipped / TAC_DEPTH_VIS_MAX * 255).astype(np.uint8)
+        depth_colored = cv2.applyColorMap(depth_vis_u8, cv2.COLORMAP_VIRIDIS)
         
         return depth_colored, normal_colored, raw_depth, raw_normals
     
@@ -743,16 +755,23 @@ class MLPProcessor(BaseProcessor):
         return np.stack([nx, ny, nz], axis=-1)
     
     def _colorize_depth(self, depth: np.ndarray) -> np.ndarray:
-        """深度图着色 - 按压越深颜色越亮"""
+        """深度图着色 - 按压越深颜色越亮
+        
+        使用固定上限避免帧间闪烁。上限 = TAC_DEPTH_MAX_MM * ppmm。
+        depth 已是非负值（按压越深值越大）。
+        
+        Args:
+            depth: 深度数据 (H, W)，非负，像素单位
+        """
         h, w = depth.shape
         
-        depth_range = depth.max() - depth.min()
-        if depth_range < 0.01:
-            return np.full((h, w, 3), [128, 0, 68], dtype=np.uint8)
-        
-        # 反转深度：按压越深（值越小/越负）-> 显示越亮
-        depth_normalized = (depth.max() - depth) / depth_range
-        depth_normalized = np.clip(depth_normalized, 0, 1)
+        # 固定可视化上限，与 so_follower 中 TAC_DEPTH_MAX_MM=3.0 对应
+        max_depth = 3.0 * self.ppmm  # 像素单位
+        depth_clipped = np.clip(depth, 0.0, max_depth)
+        if max_depth > 0:
+            depth_normalized = depth_clipped / max_depth
+        else:
+            depth_normalized = np.zeros_like(depth)
         depth_uint8 = (depth_normalized * 255).astype(np.uint8)
         return cv2.applyColorMap(depth_uint8, cv2.COLORMAP_VIRIDIS)
     
@@ -820,7 +839,12 @@ class MLPProcessor(BaseProcessor):
         G = G - self.bg_G
         
         # 泊松重建深度
-        depth = _poisson_dct_neumann(G[:, :, 0], G[:, :, 1]).astype(np.float32)
+        # _poisson_dct_neumann 输出零均值：按压区域为负，无接触在0附近
+        depth_raw = _poisson_dct_neumann(G[:, :, 0], G[:, :, 1]).astype(np.float32)
+        
+        # 翻转为「按压越深值越大」：取负，然后 clamp 到 >= 0
+        depth = -depth_raw
+        depth[depth < 0] = 0.0
         
         # 高斯模糊降噪 (对深度和梯度同时滤波)
         if self.blur_ksize > 0:
@@ -829,8 +853,18 @@ class MLPProcessor(BaseProcessor):
             G[:, :, 0] = cv2.GaussianBlur(G[:, :, 0], ksize, 0)
             G[:, :, 1] = cv2.GaussianBlur(G[:, :, 1], ksize, 0)
         
+        # 深度噪声门限：小于阈值的深度值归零，消除无接触时的噪声
+        DEPTH_NOISE_THRESHOLD = 0.3  # 像素单位，根据Poisson输出量级调整
+        depth[depth < DEPTH_NOISE_THRESHOLD] = 0.0
+        
         # 计算法向量 (在模糊后的梯度上计算，噪声更小)
         normals = self._compute_normals(G)
+        
+        # 法向量噪声门限：梯度幅值小于阈值时，强制法向量为 (0, 0, 1)
+        GRAD_NOISE_THRESHOLD = 0.02
+        grad_mag = np.sqrt(G[:, :, 0]**2 + G[:, :, 1]**2)
+        no_contact_mask = grad_mag < GRAD_NOISE_THRESHOLD
+        normals[no_contact_mask] = np.array([0.0, 0.0, 1.0])
         
         # 可视化
         depth_colored = self._colorize_depth(depth)

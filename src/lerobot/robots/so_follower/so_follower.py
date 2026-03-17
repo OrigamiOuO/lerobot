@@ -410,11 +410,13 @@ class SOFollower(Robot):
                 self._tactile_initialized[name] = True
         
         # Convert depth to uint8 (H, W, 3) for video storage.
-        # raw_depth is (H, W) in mm; clip to [0, TAC_DEPTH_MAX_MM] then map to [0, 255].
+        # raw_depth is (H, W), non-negative (pressed = large positive), pixel units.
+        # Clip to [0, TAC_DEPTH_CLIP] then map to [0, 255].
         # Repeated across 3 channels to satisfy RGB video format.
-        TAC_DEPTH_MAX_MM = 3.0
+        ppmm = processor.ppmm if processor is not None else 7.6
+        TAC_DEPTH_CLIP = 3.0 * ppmm  # pixel units: 3mm * ppmm
         if raw_depth is not None:
-            depth_u8 = np.clip(raw_depth / TAC_DEPTH_MAX_MM, 0.0, 1.0)
+            depth_u8 = np.clip(raw_depth / TAC_DEPTH_CLIP, 0.0, 1.0)
             depth_u8 = (depth_u8 * 255).astype(np.uint8)  # (H, W)
             depth = np.stack([depth_u8, depth_u8, depth_u8], axis=-1)  # (H, W, 3)
         else:

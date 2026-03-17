@@ -195,14 +195,33 @@ def main():
             cv2.putText(raw_panel, "Raw", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
             panels.append(raw_panel)
 
-            # 2) 深度图
+            # 2) 深度图 + 统计信息
             depth_panel = depth_colored.copy() if depth_colored is not None else np.zeros_like(warped)
             cv2.putText(depth_panel, "Depth", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            if raw_depth is not None:
+                d_min, d_max = raw_depth.min(), raw_depth.max()
+                d_nonzero = np.count_nonzero(raw_depth)
+                d_total = raw_depth.size
+                cv2.putText(depth_panel, f"min:{d_min:.3f} max:{d_max:.3f}",
+                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+                cv2.putText(depth_panel, f"nonzero: {d_nonzero}/{d_total} ({100*d_nonzero/d_total:.1f}%)",
+                            (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
             panels.append(depth_panel)
 
-            # 3) 法向量图
+            # 3) 法向量图 + 统计信息
             normal_panel = normal_colored.copy() if normal_colored is not None else np.zeros_like(warped)
             cv2.putText(normal_panel, "Normal", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            if raw_normals is not None and raw_normals.shape[-1] == 3:
+                # 统计有多少像素的法向量 ≈ (0,0,1)（即无接触区域）
+                nz = raw_normals[:, :, 2]
+                flat_count = np.count_nonzero(nz > 0.999)  # nz ≈ 1 means flat
+                n_total = nz.size
+                nx_std = np.std(raw_normals[:, :, 0])
+                ny_std = np.std(raw_normals[:, :, 1])
+                cv2.putText(normal_panel, f"flat: {flat_count}/{n_total} ({100*flat_count/n_total:.1f}%)",
+                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+                cv2.putText(normal_panel, f"nx_std:{nx_std:.4f} ny_std:{ny_std:.4f}",
+                            (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
             panels.append(normal_panel)
 
             # 4) Marker 位移
