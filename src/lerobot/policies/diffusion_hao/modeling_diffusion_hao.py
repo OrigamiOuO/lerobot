@@ -135,34 +135,57 @@ class DiffusionHaoPolicy(PreTrainedPolicy):
         """Prepare the batch: collect images, synthesize tactile 4-channel, flatten marker."""
         batch = dict(batch)  # shallow copy
 
-        # 1. Collect all standard image features (including tac_raw, classified as VISUAL)
+        depth_keys = list(self.config.tactile_depth_features.keys())
+        normal_keys = list(self.config.tactile_normal_features.keys())
+
+        # 1. Collect standard image features while excluding tactile depth/normal features.
+        # This keeps tac_depth/tac_normal on the dedicated 3+1 tactile branch.
         if self.config.image_features:
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+            tactile_keys = set(depth_keys + normal_keys)
+            rgb_image_keys = [key for key in self.config.image_features if key not in tactile_keys]
+            if len(rgb_image_keys) > 0:
+                batch[OBS_IMAGES] = torch.stack([batch[key] for key in rgb_image_keys], dim=-4)
 
         # 2. Synthesize tac_depth + tac_normal → 4-channel tactile image
         if self.config.has_tactile_vision:
-            # Get keys for depth and normal
-            depth_keys = list(self.config.tactile_depth_features.keys())
-            normal_keys = list(self.config.tactile_normal_features.keys())
-            
             # For now, support single tactile sensor pair
             if len(depth_keys) > 0 and len(normal_keys) > 0:
                 depth_key = depth_keys[0]
                 normal_key = normal_keys[0]
-                
-                depth = batch[depth_key]  # (B, H, W, 1) or (B, n_obs_steps, H, W, 1)
+
+                depth = batch[depth_key]
                 normal = batch[normal_key]  # (B, H, W, 3) or (B, n_obs_steps, H, W, 3)
-                
+
+                # Video-encoded depth may decode as 3 channels. Reduce it to 1 channel via channel mean.
+                # Supports both channel-first (..., C, H, W) and channel-last (..., H, W, C).
+                if depth.dim() >= 3:
+                    if depth.shape[-3] in (1, 3):
+                        depth = depth.mean(dim=-3, keepdim=True)
+                    elif depth.shape[-1] in (1, 3):
+                        depth = depth.mean(dim=-1, keepdim=True)
+
+                # Ensure normal is channel-last for concatenation below.
+                if normal.dim() >= 3 and normal.shape[-3] in (1, 3):
+                    normal_for_concat = normal.movedim(-3, -1)
+                else:
+                    normal_for_concat = normal
+
+                # Ensure depth is channel-last for concatenation below.
+                if depth.dim() >= 3 and depth.shape[-3] == 1:
+                    depth_for_concat = depth.movedim(-3, -1)
+                else:
+                    depth_for_concat = depth
+
                 # Concatenate depth and normal to 4-channel
-                tac_4ch = torch.cat([depth, normal], dim=-1)  # (..., H, W, 4)
-                
+                tac_4ch = torch.cat([depth_for_concat, normal_for_concat], dim=-1)  # (..., H, W, 4)
+
                 # Permute to channel-first format
                 # Handle both (B, H, W, 4) and (B, n_obs_steps, H, W, 4)
                 if tac_4ch.dim() == 4:
                     tac_4ch = tac_4ch.permute(0, 3, 1, 2)  # (B, 4, H, W)
                 else:
                     tac_4ch = tac_4ch.permute(0, 1, 4, 2, 3)  # (B, n_obs_steps, 4, H, W)
-                
+
                 batch[OBS_TAC_VISION] = tac_4ch
 
         # 3. Flatten tac_marker_displacement: (B, 35, 2) → (B, 70)
@@ -194,13 +217,19 @@ class DiffusionHaoModel(nn.Module):
         super().__init__()
         self.config = config
 
+        # Keep tactile depth/normal out of the RGB branch when they are video/image features.
+        self._tactile_depth_keys = list(self.config.tactile_depth_features.keys())
+        self._tactile_normal_keys = list(self.config.tactile_normal_features.keys())
+        tactile_keys = set(self._tactile_depth_keys + self._tactile_normal_keys)
+        self._rgb_image_keys = [key for key in self.config.image_features if key not in tactile_keys]
+
         # Build observation encoders
         # Start with robot state dimension
         global_cond_dim = self.config.robot_state_feature.shape[0]
 
         # === Standard image encoder (shared for visual images and tac_raw) ===
-        if self.config.image_features:
-            num_images = len(self.config.image_features)
+        if len(self._rgb_image_keys) > 0:
+            num_images = len(self._rgb_image_keys)
             if self.config.use_separate_rgb_encoder_per_camera:
                 encoders = [DiffusionRgbEncoder(config) for _ in range(num_images)]
                 self.rgb_encoder = nn.ModuleList(encoders)
@@ -287,7 +316,7 @@ class DiffusionHaoModel(nn.Module):
         global_cond_feats = [batch[OBS_STATE]]
 
         # === Extract standard image features ===
-        if self.config.image_features:
+        if len(self._rgb_image_keys) > 0:
             if self.config.use_separate_rgb_encoder_per_camera:
                 images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
                 img_features_list = torch.cat(

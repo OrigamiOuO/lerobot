@@ -46,9 +46,9 @@ class DiffusionHaoConfig(PreTrainedConfig):
     """
 
     # Inputs / output structure.
-    n_obs_steps: int = 2
+    n_obs_steps: int = 8
     horizon: int = 16
-    n_action_steps: int = 8
+    n_action_steps: int = 5
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -200,24 +200,32 @@ class DiffusionHaoConfig(PreTrainedConfig):
 
     @property
     def tactile_depth_features(self) -> dict[str, PolicyFeature]:
-        """Return features for tactile depth data (observation.tac_depth.*)."""
+        """Return features for tactile depth data.
+
+        Supports both legacy keys (``observation.tac_depth.*``) and
+        video/image-stream keys (``observation.images.tac_depth.*``).
+        """
         if not self.input_features:
             return {}
         return {
             key: ft
             for key, ft in self.input_features.items()
-            if key.startswith("observation.tac_depth.")
+            if key.startswith("observation.tac_depth.") or key.startswith("observation.images.tac_depth.")
         }
 
     @property
     def tactile_normal_features(self) -> dict[str, PolicyFeature]:
-        """Return features for tactile normal data (observation.tac_normal.*)."""
+        """Return features for tactile normal data.
+
+        Supports both legacy keys (``observation.tac_normal.*``) and
+        video/image-stream keys (``observation.images.tac_normal.*``).
+        """
         if not self.input_features:
             return {}
         return {
             key: ft
             for key, ft in self.input_features.items()
-            if key.startswith("observation.tac_normal.")
+            if key.startswith("observation.tac_normal.") or key.startswith("observation.images.tac_normal.")
         }
 
     @property

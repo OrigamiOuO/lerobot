@@ -54,6 +54,11 @@ class SOFollowerConfig:
     # this value are zeroed out to suppress noise when there is no contact.
     marker_threshold: float = 0.5
 
+    # Output size (height, width) for tactile images (tac_raw, tac_depth, tac_normal).
+    # If None, the native camera resolution is used.
+    # Set to (224, 224) at eval time to match a policy trained on 224x224 tactile images.
+    tac_output_size: tuple[int, int] | None = None
+
     # Set to `True` for backward compatibility with previous policies/dataset
     use_degrees: bool = False
 

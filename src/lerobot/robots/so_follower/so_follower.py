@@ -118,10 +118,14 @@ class SOFollower(Robot):
             return {}
         
         features = {}
+        if self.config.tac_output_size is not None:
+            out_h, out_w = self.config.tac_output_size
+        else:
+            out_h, out_w = 480, 640
         for name in self.tactile_cameras:
-            features[f"tac_raw.{name}"] = (480, 640, 3)
-            features[f"tac_depth.{name}"] = (480, 640, 3)
-            features[f"tac_normal.{name}"] = (480, 640, 3)
+            features[f"tac_raw.{name}"] = (out_h, out_w, 3)
+            features[f"tac_depth.{name}"] = (out_h, out_w, 3)
+            features[f"tac_normal.{name}"] = (out_h, out_w, 3)
             features[f"tac_marker_displacement.{name}"] = (self._num_markers, 2)
         
         return features
@@ -440,6 +444,13 @@ class SOFollower(Robot):
                 mag = np.sqrt(marker_displacement[:, 0]**2 + marker_displacement[:, 1]**2)
                 marker_displacement[mag < self._marker_threshold] = 0.0
         
+        # Resize tactile images if tac_output_size is configured
+        if self.config.tac_output_size is not None:
+            out_h, out_w = self.config.tac_output_size
+            warped_frame_rgb = cv2.resize(warped_frame_rgb, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+            depth = cv2.resize(depth, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+            normal = cv2.resize(normal, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+
         return {
             f"tac_raw.{name}": warped_frame_rgb,
             f"tac_depth.{name}": depth,

@@ -181,6 +181,7 @@ outputs/
 # Dataset folders
 datasets/
 hao_datasets/
+hao_datasets
 
 # checkpoints
 checkpoints/
