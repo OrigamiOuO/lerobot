@@ -272,8 +272,8 @@ class SOFollower(Robot):
                 self.bus.write("D_Coefficient", motor, 32)
 
                 if motor == "gripper":
-                    self.bus.write("Max_Torque_Limit", motor, 500)  # 50% of max torque to avoid burnout
-                    self.bus.write("Protection_Current", motor, 250)  # 50% of max current to avoid burnout
+                    self.bus.write("Max_Torque_Limit", motor, 700)  # 50% of max torque to avoid burnout
+                    self.bus.write("Protection_Current", motor, 350)  # 50% of max current to avoid burnout
                     self.bus.write("Overload_Torque", motor, 25)  # 25% torque when overloaded
 
     def setup_motors(self) -> None:
@@ -391,8 +391,8 @@ class SOFollower(Robot):
             warped_frame_bgr = processor.warp_perspective(frame_bgr)
         else:
             warped_frame_bgr = frame_bgr
-            raw_depth = np.zeros((h, w), dtype=np.float32)
-            raw_normals = np.zeros((h, w, 3), dtype=np.float32)
+            raw_depth = np.zeros((h, w), dtype=np.float16)
+            raw_normals = np.zeros((h, w, 3), dtype=np.float16)
         
         # Convert warped frame back to RGB for dataset storage
         # (tac_raw is stored as observation.images.*, which expects RGB)
@@ -414,11 +414,13 @@ class SOFollower(Robot):
                 self._tactile_initialized[name] = True
         
         # Convert depth to uint8 (H, W, 3) for video storage.
-        # raw_depth is (H, W) in mm; clip to [0, TAC_DEPTH_MAX_MM] then map to [0, 255].
+        # raw_depth is (H, W), non-negative (pressed = large positive), pixel units.
+        # Clip to [0, TAC_DEPTH_CLIP] then map to [0, 255].
         # Repeated across 3 channels to satisfy RGB video format.
-        TAC_DEPTH_MAX_MM = 3.0
+        ppmm = processor.ppmm if processor is not None else 7.6
+        TAC_DEPTH_CLIP = 3.0 * ppmm  # pixel units: 3mm * ppmm
         if raw_depth is not None:
-            depth_u8 = np.clip(raw_depth / TAC_DEPTH_MAX_MM, 0.0, 1.0)
+            depth_u8 = np.clip(raw_depth / TAC_DEPTH_CLIP, 0.0, 1.0)
             depth_u8 = (depth_u8 * 255).astype(np.uint8)  # (H, W)
             depth = np.stack([depth_u8, depth_u8, depth_u8], axis=-1)  # (H, W, 3)
         else:
@@ -457,6 +459,27 @@ class SOFollower(Robot):
             f"tac_normal.{name}": normal,
             f"tac_marker_displacement.{name}": marker_displacement,
         }
+
+    def reset_tactile(self):
+        """Reset all tactile processors and marker trackers for new episode.
+
+        After calling this, the processors will re-collect background frames.
+        Call `get_observation()` repeatedly until `tactile_ready` is True
+        before starting to record.
+        """
+        for name, processor in self.tactile_processors.items():
+            processor.reset()
+            self._tactile_initialized[name] = False
+        logger.info("All tactile sensors reset, collecting new background...")
+
+    @property
+    def tactile_ready(self) -> bool:
+        """True when all tactile processors have finished background collection."""
+        if not self.tactile_processors:
+            return True
+        return all(
+            not proc.con_flag for proc in self.tactile_processors.values()
+        )
 
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:

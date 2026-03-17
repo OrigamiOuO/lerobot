@@ -170,8 +170,9 @@ class ACTHaoPolicy(PreTrainedPolicy):
 
         # 2. Synthesize tac_depth + tac_normal → 4-channel tactile image
         if self.config.has_tactile_vision:
-            depth = batch[OBS_TAC_DEPTH]    # (B, 480, 640, 1) — float32, HWC
-            normal = batch[OBS_TAC_NORMAL]  # (B, 480, 640, 3) — float32, HWC
+            # Data stored as float16 for compression; upcast to float32 for computation
+            depth = batch[OBS_TAC_DEPTH].float()    # (B, 480, 640, 1) → float32
+            normal = batch[OBS_TAC_NORMAL].float()  # (B, 480, 640, 3) → float32
             tac_4ch = torch.cat([depth, normal], dim=-1)  # (B, H, W, 4)
             tac_4ch = tac_4ch.permute(0, 3, 1, 2)         # (B, 4, H, W)
             batch[OBS_TAC_VISION] = tac_4ch

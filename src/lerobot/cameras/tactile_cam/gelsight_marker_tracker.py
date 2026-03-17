@@ -38,6 +38,14 @@ class GelSightMarkerTracker:
         self.touchMarkerMovThresh = 1
         self.touchMarkerNumThresh = 20
         
+        # 匹配距离上限（像素），超过此距离认为 marker 丢失而非移动
+        self.match_max_dist = 25.0
+        
+        # EMA 时间滤波系数 (0~1, 越小越平滑, 1=不滤波)
+        self.ema_alpha = 0.4
+        self._smoothU = None
+        self._smoothV = None
+        
         # 窗口名称
         self.window_name = 'Marker Motion'
 
@@ -66,6 +74,8 @@ class GelSightMarkerTracker:
         self.MarkerCount = len(self.flowcenter)
         self.markerU = np.zeros(self.MarkerCount)  # X方向运动
         self.markerV = np.zeros(self.MarkerCount)  # Y方向运动
+        self._smoothU = np.zeros(self.MarkerCount)
+        self._smoothV = np.zeros(self.MarkerCount)
         
         # 创建显示窗口
         if self.IsDisplay:
@@ -89,17 +99,26 @@ class GelSightMarkerTracker:
         diff_max = np.max(I, axis=2)
 
         if mode == "dark":      # marker 比背景暗
-            mask = diff_max < -thresh
+            signal = -diff_max  # 翻转使 marker 区域为正
         else:                   # marker 比背景亮
-            mask = diff_max > thresh
+            signal = diff_max
 
-        mask = mask.astype(np.uint8)
+        # 自适应阈值：用 Otsu 在信号图上自动选阈值，比固定 thresh 更鲁棒
+        signal_clipped = np.clip(signal, 0, 255).astype(np.uint8)
+        otsu_val, mask_otsu = cv2.threshold(signal_clipped, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # 如果 Otsu 阈值太低（噪声主导），回退到固定阈值
+        if otsu_val < thresh:
+            if mode == "dark":
+                mask = (diff_max < -thresh).astype(np.uint8)
+            else:
+                mask = (diff_max > thresh).astype(np.uint8)
+        else:
+            mask = (mask_otsu // 255).astype(np.uint8)
 
-        # === 关键：形态学开闭去噪 ===
-        # 小的孤立点直接干掉
+        # === 形态学开闭去噪 ===
         kernel = np.ones((3, 3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        # 填一下小孔，避免 marker 被吃断
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
 
         self.MarkerMask = mask.astype(bool)
@@ -128,13 +147,16 @@ class GelSightMarkerTracker:
         cv2.waitKey(1)
 
     def find_markers(self):
-        """查找标记点"""
+        """查找标记点（鲁棒版本：不因数量少而整体放弃）"""
         if self.img is None:
             return np.empty([0, 3])
             
         self._loc_markerArea()
-        areaThresh1 = 50
-        areaThresh2 = 400
+        if self.MarkerMask is None:
+            return np.empty([0, 3])
+        
+        areaThresh1 = 20   # 最小面积（放宽以适应不同曝光）
+        areaThresh2 = 600   # 最大面积（放宽一点）
         MarkerCenter = np.empty([0, 3])
 
         contours = cv2.findContours(self.MarkerMask.astype(np.uint8), 
@@ -146,11 +168,9 @@ class GelSightMarkerTracker:
             contours = contours[1]
         else:
             contours = contours[0]
-            
-        if len(contours) < 25:  # 标记点太少则放弃
-            self.MarkerAvailable = False
-            return MarkerCenter
-
+        
+        # 不再因 contour 数量少而直接放弃；
+        # 找到多少就用多少，匹配阶段会处理缺失
         for contour in contours:
             AreaCount = cv2.contourArea(contour)
             if areaThresh1 < AreaCount < areaThresh2:
@@ -161,16 +181,22 @@ class GelSightMarkerTracker:
                                              t['m01'] / t['m00'], 
                                              AreaCount]], axis=0)
         
+        if len(MarkerCenter) == 0:
+            self.MarkerAvailable = False
+        else:
+            self.MarkerAvailable = True
+        
         self.current_markers = MarkerCenter  # 存储当前帧检测到的标记点
         return MarkerCenter
 
     def _cal_marker_center_motion(self, MarkerCenter):
-        """计算标记点中心运动"""
+        """计算标记点中心运动（带距离上限，防止错误匹配导致位移飙升）"""
         Nt = len(MarkerCenter)
         if Nt == 0 or self.MarkerCount == 0:
             return np.zeros([self.MarkerCount, 3])
             
         no_seq2 = np.zeros(Nt, dtype=int)
+        min_dist2 = np.full(Nt, 1e9)  # 记录每个当前marker到最近上一帧marker的距离
         center_now = np.zeros([self.MarkerCount, 3])
         
         # 第一轮匹配：从当前帧到上一帧
@@ -179,7 +205,9 @@ class GelSightMarkerTracker:
                 dif = np.abs(MarkerCenter[i, 0] - self.marker_last[:, 0]) + \
                       np.abs(MarkerCenter[i, 1] - self.marker_last[:, 1])
                 if len(dif) > 0:
-                    no_seq2[i] = np.argmin(dif * (100 + np.abs(MarkerCenter[i, 2] - self.flowcenter[:, 2])))
+                    cost = dif * (100 + np.abs(MarkerCenter[i, 2] - self.flowcenter[:, 2]))
+                    no_seq2[i] = np.argmin(cost)
+                    min_dist2[i] = np.min(dif)
 
         # 第二轮匹配：从上一帧到当前帧
         for i in range(self.MarkerCount):
@@ -190,8 +218,14 @@ class GelSightMarkerTracker:
                     t = dif * (100 + np.abs(MarkerCenter[:, 2] - self.flowcenter[i, 2]))
                     a = np.amin(t) / 100
                     b = np.argmin(t)
+                    nearest_dist = np.min(dif)
                     
-                    if self.flowcenter[i, 2] < a:  # 小区域忽略
+                    # 距离超过上限 → 认为该 marker 丢失，位移归零
+                    if nearest_dist > self.match_max_dist:
+                        self.markerU[i] = 0
+                        self.markerV[i] = 0
+                        center_now[i] = self.flowcenter[i]
+                    elif self.flowcenter[i, 2] < a:  # 小区域忽略
                         self.markerU[i] = 0
                         self.markerV[i] = 0
                         center_now[i] = self.flowcenter[i]
@@ -208,7 +242,7 @@ class GelSightMarkerTracker:
         return center_now
 
     def update_markerMotion(self, img=None):
-        """更新标记点运动"""
+        """更新标记点运动（含 EMA 时间滤波）"""
         if img is not None:
             self.img = img
             
@@ -216,13 +250,25 @@ class GelSightMarkerTracker:
         if len(MarkerCenter) > 0:
             self.marker_last = self._cal_marker_center_motion(MarkerCenter)
         
-        if self.IsDisplay:
-            self.displayIm()
-        
+        # 死区过滤：小于 0.5px 的位移视为噪声
         disp = np.sqrt(self.markerU**2 + self.markerV**2)
-        small_motion_mask = disp < 0.5   # 阈值：0.5 px 小抖动全部忽略
+        small_motion_mask = disp < 0.5
         self.markerU[small_motion_mask] = 0
         self.markerV[small_motion_mask] = 0
+        
+        # EMA 时间滤波：平滑帧间跳动
+        if self._smoothU is not None and len(self._smoothU) == self.MarkerCount:
+            alpha = self.ema_alpha
+            self._smoothU = alpha * self.markerU + (1 - alpha) * self._smoothU
+            self._smoothV = alpha * self.markerV + (1 - alpha) * self._smoothV
+            self.markerU = self._smoothU.copy()
+            self.markerV = self._smoothV.copy()
+        else:
+            self._smoothU = self.markerU.copy()
+            self._smoothV = self.markerV.copy()
+        
+        if self.IsDisplay:
+            self.displayIm()
 
     def get_marker_displacements(self):
         """
