@@ -35,7 +35,7 @@ from lerobot.policies.diffusion_hao.configuration_diffusion_hao import Diffusion
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
-from lerobot.policies.act_hao.configuration_act_hao import ACTHaoConfig
+
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
@@ -133,22 +133,7 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.wall_x.modeling_wall_x import WallXPolicy
 
         return WallXPolicy
-    elif name == "tactile_diffusion":
-        from lerobot.policies.tactile_diffusion.modeling_tactile_diffusion import TactileDiffusionPolicy
 
-        return TactileDiffusionPolicy
-    elif name == "tactile_blind_diffusion":
-        from lerobot.policies.tactile_blind_diffusion.modeling_tactile_blind_diffusion import TactileDiffusionPolicy
-
-        return TactileDiffusionPolicy
-    elif name == "tactile_act":
-        from lerobot.policies.tactile_act.modeling_tactile_act import TactileACTPolicy
-
-        return TactileACTPolicy
-    elif name == "act_hao":
-        from lerobot.policies.act_hao.modeling_act_hao import ACTHaoPolicy
-
-        return ACTHaoPolicy
     elif name == "diffusion_hao":
         from lerobot.policies.diffusion_hao.modeling_diffusion_hao import DiffusionHaoPolicy
 
@@ -203,8 +188,6 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return XVLAConfig(**kwargs)
     elif policy_type == "wall_x":
         return WallXConfig(**kwargs)
-    elif policy_type == "act_hao":
-        return ACTHaoConfig(**kwargs)
     elif policy_type == "diffusion_hao":
         return DiffusionHaoConfig(**kwargs)
     else:
@@ -339,14 +322,6 @@ def make_pre_post_processors(
         from lerobot.policies.act.processor_act import make_act_pre_post_processors
 
         processors = make_act_pre_post_processors(
-            config=policy_cfg,
-            dataset_stats=kwargs.get("dataset_stats"),
-        )
-
-    elif isinstance(policy_cfg, ACTHaoConfig):
-        from lerobot.policies.act_hao.processor_act_hao import make_act_hao_pre_post_processors
-
-        processors = make_act_hao_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

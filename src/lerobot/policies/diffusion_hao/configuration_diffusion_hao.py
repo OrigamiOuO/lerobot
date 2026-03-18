@@ -46,9 +46,9 @@ class DiffusionHaoConfig(PreTrainedConfig):
     """
 
     # Inputs / output structure.
-    n_obs_steps: int = 8
+    n_obs_steps: int = 16
     horizon: int = 16
-    n_action_steps: int = 5
+    n_action_steps: int = 8
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -64,20 +64,30 @@ class DiffusionHaoConfig(PreTrainedConfig):
 
     # === Vision backbone (for standard images and tac_raw) ===
     vision_backbone: str = "resnet18"
-    crop_shape: tuple[int, int] | None = (84, 84)
+    crop_shape: tuple[int, int] | None = (480, 480)
     crop_is_random: bool = True
-    pretrained_backbone_weights: str | None = None
-    use_group_norm: bool = True
+    resize_shape: tuple[int, int] | None = (224, 224)
+    pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
+    use_group_norm: bool = False
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
 
-    # === Tactile vision backbone (for tac_depth + tac_normal 4-channel data) ===
-    tactile_vision_backbone: str = "resnet18"
-    tactile_backbone_in_channels: int = 4  # depth(1) + normal(3)
-    tactile_pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
+    # ### Tactile info config ###
     tactile_use_group_norm: bool = False  # Use BatchNorm for pretrained
     tactile_spatial_softmax_num_keypoints: int = 32
-    tactile_crop_shape: tuple[int, int] | None = (84, 84)
+    tactile_crop_shape: tuple[int, int] | None = (480, 480)
+    tactile_resize_shape: tuple[int, int] | None = (224, 224)
+
+    # === Tactile raw image backbone (for tac_raw 3-channel data) ===
+    tactile_raw_backbone: str = "resnet18"
+    tactile_raw_backbone_in_channels: int = 3  # raw tactile images typically have 3 channels (e.g. RGB or grayscale repeated)
+    tactile_raw_pretrained_backbone_weights: str | None = None
+
+    # TODO: add different encoder for tactile depth and tactile normal instead of fusing them as 4-channel input to a single backbone
+    # === Tactile vision backbone (for tac_depth + tac_normal 4-channel data) ===
+    tactile_fused_backbone: str = "resnet18"
+    tactile_fused_backbone_in_channels: int = 4  # depth(3) + normal(1)
+    tactile_fused_pretrained_backbone_weights: str | None = None
 
     # === Tactile marker encoder ===
     tactile_marker_input_dim: int = 70  # 35 markers × 2 coordinates
@@ -123,10 +133,16 @@ class DiffusionHaoConfig(PreTrainedConfig):
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
             )
 
-        if not self.tactile_vision_backbone.startswith("resnet"):
+        if not self.tactile_raw_backbone.startswith("resnet"):
             raise ValueError(
-                f"`tactile_vision_backbone` must be one of the ResNet variants. "
-                f"Got {self.tactile_vision_backbone}."
+                f"`tactile_raw_backbone` must be one of the ResNet variants. "
+                f"Got {self.tactile_raw_backbone}."
+            )
+
+        if not self.tactile_fused_backbone.startswith("resnet"):
+            raise ValueError(
+                f"`tactile_fused_backbone` must be one of the ResNet variants. "
+                f"Got {self.tactile_fused_backbone}."
             )
 
         supported_prediction_types = ["epsilon", "sample"]
@@ -199,6 +215,17 @@ class DiffusionHaoConfig(PreTrainedConfig):
     # === Tactile feature properties ===
 
     @property
+    def tactile_raw_features(self) -> dict[str, PolicyFeature]:
+        """Return features for raw tactile images (legacy support)."""
+        if not self.input_features:
+            return {}
+        return {
+            key: ft
+            for key, ft in self.input_features.items()
+            if key.startswith("observation.images.tac_raw.") or key.startswith("observation.tac_raw.")
+        }
+
+    @property
     def tactile_depth_features(self) -> dict[str, PolicyFeature]:
         """Return features for tactile depth data.
 
@@ -239,8 +266,25 @@ class DiffusionHaoConfig(PreTrainedConfig):
             if key.startswith("observation.tac_marker_displacement.")
         }
 
+
+
     @property
-    def has_tactile_vision(self) -> bool:
+    def has_tactile_raw(self) -> bool:
+        """Check if raw tactile image data is present."""
+        return len(self.tactile_raw_features) > 0
+
+    @property
+    def has_tactile_depth(self) -> bool:
+        """Check if tactile depth data is present."""
+        return len(self.tactile_depth_features) > 0
+
+    @property
+    def has_tactile_normal(self) -> bool:
+        """Check if tactile normal data is present."""
+        return len(self.tactile_normal_features) > 0
+
+    @property
+    def has_tactile_fused(self) -> bool:
         """Check if tactile vision data (depth + normal) is present."""
         return len(self.tactile_depth_features) > 0 and len(self.tactile_normal_features) > 0
 

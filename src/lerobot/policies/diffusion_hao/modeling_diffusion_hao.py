@@ -47,7 +47,8 @@ from lerobot.policies.utils import (
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
 # Custom keys for tactile data
-OBS_TAC_VISION = "observation.tac_vision"  # Synthetic 4-channel key (depth + normal)
+OBS_TAC_FUSED = "observation.tac_fused"  # Synthetic 4-channel key (depth + normal)
+OBS_TAC_RAW = "observation.tac_raw"  # Raw tactile image data
 OBS_TAC_MARKER = "observation.tac_marker"  # Flattened marker displacement
 
 
@@ -93,8 +94,10 @@ class DiffusionHaoPolicy(PreTrainedPolicy):
             self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
         if self.config.env_state_feature:
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
-        if self.config.has_tactile_vision:
-            self._queues[OBS_TAC_VISION] = deque(maxlen=self.config.n_obs_steps)
+        if self.config.has_tactile_raw:
+            self._queues[OBS_TAC_RAW] = deque(maxlen=self.config.n_obs_steps)
+        if self.config.has_tactile_fused:
+            self._queues[OBS_TAC_FUSED] = deque(maxlen=self.config.n_obs_steps)
         if self.config.has_tactile_marker:
             self._queues[OBS_TAC_MARKER] = deque(maxlen=self.config.n_obs_steps)
 
@@ -137,58 +140,71 @@ class DiffusionHaoPolicy(PreTrainedPolicy):
 
         depth_keys = list(self.config.tactile_depth_features.keys())
         normal_keys = list(self.config.tactile_normal_features.keys())
+        tac_raw_keys = list(self.config.tactile_raw_features.keys())
 
-        # 1. Collect standard image features while excluding tactile depth/normal features.
-        # This keeps tac_depth/tac_normal on the dedicated 3+1 tactile branch.
+        # 1. Collect standard image features while excluding tactile raw/depth/normal features.
+        # This keeps tac_raw/tac_depth/tac_normal 
         if self.config.image_features:
-            tactile_keys = set(depth_keys + normal_keys)
+            tactile_keys = set(depth_keys + normal_keys + tac_raw_keys)
             rgb_image_keys = [key for key in self.config.image_features if key not in tactile_keys]
             if len(rgb_image_keys) > 0:
                 batch[OBS_IMAGES] = torch.stack([batch[key] for key in rgb_image_keys], dim=-4)
+        
+        # 2. Collect tactile raw features (if present) without mixing them with RGB image features.
+        if self.config.has_tactile_raw:
+            if len(tac_raw_keys) > 0:
+                # Support single or multiple tactile raw cameras
+                tac_raw_images = torch.stack([batch[key] for key in tac_raw_keys], dim=-4)
+                batch[OBS_TAC_RAW] = tac_raw_images  # (b, s, n_raw, h, w, c) or (b, s, h, w, c) if n_raw=1
 
-        # 2. Synthesize tac_depth + tac_normal → 4-channel tactile image
-        if self.config.has_tactile_vision:
-            # For now, support single tactile sensor pair
+        # 3. Synthesize tac_depth + tac_normal → 4-channel tactile images (supports multiple sensor pairs)
+        if self.config.has_tactile_fused:
             if len(depth_keys) > 0 and len(normal_keys) > 0:
-                depth_key = depth_keys[0]
-                normal_key = normal_keys[0]
+                # Support single or multiple depth+normal pairs
+                fused_list = []
+                for depth_idx in range(len(depth_keys)):
+                    depth = batch[depth_keys[depth_idx]]
+                    normal = batch[normal_keys[depth_idx]]  # (B, H, W, 3) or (B, n_obs_steps, H, W, 3)
 
-                depth = batch[depth_key]
-                normal = batch[normal_key]  # (B, H, W, 3) or (B, n_obs_steps, H, W, 3)
+                    # Video-encoded depth may decode as 3 channels. Reduce it to 1 channel via channel mean.
+                    # Supports both channel-first (..., C, H, W) and channel-last (..., H, W, C).
+                    if depth.dim() >= 3:
+                        if depth.shape[-3] in (1, 3):
+                            depth = depth.mean(dim=-3, keepdim=True)
+                        elif depth.shape[-1] in (1, 3):
+                            depth = depth.mean(dim=-1, keepdim=True)
 
-                # Video-encoded depth may decode as 3 channels. Reduce it to 1 channel via channel mean.
-                # Supports both channel-first (..., C, H, W) and channel-last (..., H, W, C).
-                if depth.dim() >= 3:
-                    if depth.shape[-3] in (1, 3):
-                        depth = depth.mean(dim=-3, keepdim=True)
-                    elif depth.shape[-1] in (1, 3):
-                        depth = depth.mean(dim=-1, keepdim=True)
+                    # Ensure normal is channel-last for concatenation below.
+                    if normal.dim() >= 3 and normal.shape[-3] in (1, 3):
+                        normal_for_concat = normal.movedim(-3, -1)
+                    else:
+                        normal_for_concat = normal
 
-                # Ensure normal is channel-last for concatenation below.
-                if normal.dim() >= 3 and normal.shape[-3] in (1, 3):
-                    normal_for_concat = normal.movedim(-3, -1)
+                    # Ensure depth is channel-last for concatenation below.
+                    if depth.dim() >= 3 and depth.shape[-3] == 1:
+                        depth_for_concat = depth.movedim(-3, -1)
+                    else:
+                        depth_for_concat = depth
+
+                    # Concatenate depth and normal to 4-channel
+                    tac_4ch = torch.cat([normal_for_concat, depth_for_concat], dim=-1)  # (..., H, W, 4)
+
+                    # Permute to channel-first format
+                    # Handle both (B, H, W, 4) and (B, n_obs_steps, H, W, 4)
+                    if tac_4ch.dim() == 4:
+                        tac_4ch = tac_4ch.permute(0, 3, 1, 2)  # (B, 4, H, W)
+                    else:
+                        tac_4ch = tac_4ch.permute(0, 1, 4, 2, 3)  # (B, n_obs_steps, 4, H, W)
+
+                    fused_list.append(tac_4ch)
+
+                # Stack multiple fused pairs if present
+                if len(fused_list) > 1:
+                    batch[OBS_TAC_FUSED] = torch.stack(fused_list, dim=-4)  # (B, n_obs_steps, n_fused, 4, H, W)
                 else:
-                    normal_for_concat = normal
+                    batch[OBS_TAC_FUSED] = fused_list[0]  # (B, n_obs_steps, 4, H, W)
 
-                # Ensure depth is channel-last for concatenation below.
-                if depth.dim() >= 3 and depth.shape[-3] == 1:
-                    depth_for_concat = depth.movedim(-3, -1)
-                else:
-                    depth_for_concat = depth
-
-                # Concatenate depth and normal to 4-channel
-                tac_4ch = torch.cat([depth_for_concat, normal_for_concat], dim=-1)  # (..., H, W, 4)
-
-                # Permute to channel-first format
-                # Handle both (B, H, W, 4) and (B, n_obs_steps, H, W, 4)
-                if tac_4ch.dim() == 4:
-                    tac_4ch = tac_4ch.permute(0, 3, 1, 2)  # (B, 4, H, W)
-                else:
-                    tac_4ch = tac_4ch.permute(0, 1, 4, 2, 3)  # (B, n_obs_steps, 4, H, W)
-
-                batch[OBS_TAC_VISION] = tac_4ch
-
-        # 3. Flatten tac_marker_displacement: (B, 35, 2) → (B, 70)
+        # 4. Flatten tac_marker_displacement: (B, 35, 2) → (B, 70)
         if self.config.has_tactile_marker:
             marker_keys = list(self.config.tactile_marker_features.keys())
             if len(marker_keys) > 0:
@@ -217,10 +233,13 @@ class DiffusionHaoModel(nn.Module):
         super().__init__()
         self.config = config
 
-        # Keep tactile depth/normal out of the RGB branch when they are video/image features.
+        # Keep tactile raw/depth/normal out of the RGB branch when they are video/image features.
         self._tactile_depth_keys = list(self.config.tactile_depth_features.keys())
         self._tactile_normal_keys = list(self.config.tactile_normal_features.keys())
-        tactile_keys = set(self._tactile_depth_keys + self._tactile_normal_keys)
+        self._tactile_raw_keys = list(self.config.tactile_raw_features.keys())
+
+        tactile_keys = set(self._tactile_depth_keys + self._tactile_normal_keys + self._tactile_raw_keys)
+
         self._rgb_image_keys = [key for key in self.config.image_features if key not in tactile_keys]
 
         # Build observation encoders
@@ -242,10 +261,15 @@ class DiffusionHaoModel(nn.Module):
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
 
-        # === Tactile vision encoder (for depth + normal 4-channel data) ===
-        if self.config.has_tactile_vision:
-            self.tactile_vision_encoder = TactileVisionEncoder(config)
-            global_cond_dim += self.tactile_vision_encoder.feature_dim
+        # === Environment
+        if self.config.has_tactile_raw:
+            self.tactile_raw_encoder = TactileRawEncoder(config)
+            global_cond_dim += self.tactile_raw_encoder.feature_dim
+
+        # === Tactile depth/normal encoder (for depth + normal 4-channel data) ===
+        if self.config.has_tactile_fused:
+            self.tactile_fused_encoder = TactileFusedEncoder(config)
+            global_cond_dim += self.tactile_fused_encoder.feature_dim
 
         # === Tactile marker encoder (for marker displacement) ===
         if self.config.has_tactile_marker:
@@ -341,15 +365,48 @@ class DiffusionHaoModel(nn.Module):
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV_STATE])
 
-        # === Extract tactile vision features (depth + normal) ===
-        if self.config.has_tactile_vision:
-            tac_vision = batch[OBS_TAC_VISION]  # (B, n_obs_steps, 4, H, W)
-            # Combine batch and sequence dims
-            tac_vision_flat = einops.rearrange(tac_vision, "b s c h w -> (b s) c h w")
-            tac_features = self.tactile_vision_encoder(tac_vision_flat)
-            # Separate batch and sequence dims
-            tac_features = einops.rearrange(tac_features, "(b s) d -> b s d", b=batch_size, s=n_obs_steps)
-            global_cond_feats.append(tac_features)
+        # === Extract tactile raw features ===
+        if self.config.has_tactile_raw:
+            tac_raw = batch[OBS_TAC_RAW]  # (B, n_obs_steps, 3, H, W) or (B, n_obs_steps, n_raw, 3, H, W)
+            if tac_raw.dim() == 5:
+                # Single tactile raw camera
+                tac_raw_features = self.tactile_raw_encoder(einops.rearrange(tac_raw, "b s c h w -> (b s) c h w"))
+                tac_raw_features = einops.rearrange(tac_raw_features, "(b s) d -> b s d", b=batch_size, s=n_obs_steps)
+            else:
+                # Multiple tactile raw cameras (B, n_obs_steps, n_raw, 3, H, W)
+                num_raw = tac_raw.shape[2]
+                tac_raw_per_camera = einops.rearrange(tac_raw, "b s n c h w -> n (b s) c h w")
+                raw_features_list = [
+                    self.tactile_raw_encoder(images)
+                    for images in tac_raw_per_camera
+                ]
+                raw_features_stacked = torch.cat(raw_features_list, dim=0)
+                tac_raw_features = einops.rearrange(
+                    raw_features_stacked, "(n b s) d -> b s (n d)", b=batch_size, s=n_obs_steps, n=num_raw
+                )
+            global_cond_feats.append(tac_raw_features)
+
+        # === Extract tactile fused features (depth + normal) ===
+        if self.config.has_tactile_fused:
+            tac_fused = batch[OBS_TAC_FUSED]  # (B, n_obs_steps, 4, H, W) or (B, n_obs_steps, n_fused, 4, H, W)
+            if tac_fused.dim() == 5:
+                # Single fused pair (depth + normal)
+                tac_fused_flat = einops.rearrange(tac_fused, "b s c h w -> (b s) c h w")
+                tac_fused_features = self.tactile_fused_encoder(tac_fused_flat)
+                tac_fused_features = einops.rearrange(tac_fused_features, "(b s) d -> b s d", b=batch_size, s=n_obs_steps)
+            else:
+                # Multiple fused pairs (B, n_obs_steps, n_fused, 4, H, W)
+                num_fused = tac_fused.shape[2]
+                tac_fused_per_sensor = einops.rearrange(tac_fused, "b s n c h w -> n (b s) c h w")
+                fused_features_list = [
+                    self.tactile_fused_encoder(images)
+                    for images in tac_fused_per_sensor
+                ]
+                fused_features_stacked = torch.cat(fused_features_list, dim=0)
+                tac_fused_features = einops.rearrange(
+                    fused_features_stacked, "(n b s) d -> b s (n d)", b=batch_size, s=n_obs_steps, n=num_fused
+                )
+            global_cond_feats.append(tac_fused_features)
 
         # === Extract tactile marker features ===
         if self.config.has_tactile_marker:
@@ -424,8 +481,82 @@ class DiffusionHaoModel(nn.Module):
 
         return loss.mean()
 
+class TactileRawEncoder(nn.Module):
+    """Encodes 3-channel tactile raw data into a feature vector.
+    
+    Uses a ResNet backbone modified to accept 3-channel input, with pretrained
+    weights for the RGB channels.
+    """
 
-class TactileVisionEncoder(nn.Module):
+    def __init__(self, config:DiffusionHaoConfig):
+        super().__init__()
+        self.config = config
+
+        # Set up optional preprocessing (crop)
+        if config.tactile_crop_shape is not None:
+            self.do_crop = True
+            self.center_crop = torchvision.transforms.CenterCrop(config.tactile_crop_shape)
+            if config.crop_is_random:
+                self.maybe_random_crop = torchvision.transforms.RandomCrop(config.tactile_crop_shape)
+            else:
+                self.maybe_random_crop = self.center_crop
+        else:
+            self.do_crop = False
+
+        # optional preprocessing (resize)
+        if config.tactile_resize_shape is not None:
+            self.do_resize = True
+            self.resize = torchvision.transforms.Resize(config.tactile_resize_shape)
+        else:
+            self.do_resize = False
+
+        backbone_model = getattr(torchvision.models, config.tactile_raw_backbone)(
+            weights=config.tactile_raw_pretrained_backbone_weights
+        )
+        self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
+
+        if config.use_group_norm:
+            if config.tactile_raw_pretrained_backbone_weights:
+                raise ValueError(
+                    "You can't replace BatchNorm in a pretrained model without ruining the weights!"
+                )
+            self.backbone = _replace_submodules(
+                root_module=self.backbone,
+                predicate=lambda x: isinstance(x, nn.BatchNorm2d),
+                func=lambda x: nn.GroupNorm(num_groups=x.num_features // 16, num_channels=x.num_features),
+            )
+
+        images_shape = next(iter(config.tactile_raw_features.values())).shape
+        # Determine final input shape to backbone (resize has priority over crop)
+        if config.tactile_resize_shape is not None:
+            final_shape_h_w = config.tactile_resize_shape
+        elif config.tactile_crop_shape is not None:
+            final_shape_h_w = config.tactile_crop_shape
+        else:
+            final_shape_h_w = images_shape[1:]
+        dummy_shape = (1, images_shape[0], *final_shape_h_w)
+        feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
+
+        self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
+        self.feature_dim = config.spatial_softmax_num_keypoints * 2
+        self.out = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
+        self.relu = nn.ReLU()
+
+    def forward(self, x: Tensor) -> Tensor:
+        if self.do_crop:
+            if self.training:
+                x = self.maybe_random_crop(x)
+            else:
+                x = self.center_crop(x)
+        if self.do_resize:
+            x = self.resize(x)  
+
+        x = torch.flatten(self.pool(self.backbone(x)), start_dim=1)
+        x = self.relu(self.out(x))
+        return x
+    
+
+class TactileFusedEncoder(nn.Module):
     """Encodes 4-channel tactile data (depth + normal) into a feature vector.
 
     Uses a ResNet backbone modified to accept 4-channel input, with pretrained
@@ -447,15 +578,22 @@ class TactileVisionEncoder(nn.Module):
         else:
             self.do_crop = False
 
+        # optional preprocessing (resize)
+        if config.tactile_resize_shape is not None:
+            self.do_resize = True
+            self.resize = torchvision.transforms.Resize(config.tactile_resize_shape)
+        else:
+            self.do_resize = False
+
         # Set up backbone with 4-channel input
-        backbone_model = getattr(torchvision.models, config.tactile_vision_backbone)(
-            weights=config.tactile_pretrained_backbone_weights
+        backbone_model = getattr(torchvision.models, config.tactile_fused_backbone)(
+            weights=config.tactile_fused_pretrained_backbone_weights
         )
 
         # Modify first conv layer to accept 4 channels
         original_conv = backbone_model.conv1
         new_conv = nn.Conv2d(
-            config.tactile_backbone_in_channels,
+            config.tactile_fused_backbone_in_channels,
             original_conv.out_channels,
             kernel_size=original_conv.kernel_size,
             stride=original_conv.stride,
@@ -465,11 +603,11 @@ class TactileVisionEncoder(nn.Module):
 
         # Initialize weights: copy RGB weights, init depth channel with mean
         with torch.no_grad():
-            if config.tactile_pretrained_backbone_weights is not None:
+            if config.tactile_fused_pretrained_backbone_weights is not None:
                 # Copy RGB weights (first 3 channels)
                 new_conv.weight[:, :3] = original_conv.weight[:, :3]
                 # Initialize additional channels with mean of RGB weights
-                for i in range(3, config.tactile_backbone_in_channels):
+                for i in range(3, config.tactile_fused_backbone_in_channels):
                     new_conv.weight[:, i:i+1] = original_conv.weight.mean(dim=1, keepdim=True)
             else:
                 nn.init.kaiming_normal_(new_conv.weight, mode='fan_out', nonlinearity='relu')
@@ -489,7 +627,7 @@ class TactileVisionEncoder(nn.Module):
 
         # Set up pooling and final layers
         # Get tactile image shape from config
-        if config.has_tactile_vision:
+        if config.has_tactile_fused:
             depth_features = config.tactile_depth_features
             if len(depth_features) > 0:
                 first_depth_ft = next(iter(depth_features.values()))
@@ -501,19 +639,30 @@ class TactileVisionEncoder(nn.Module):
         else:
             h, w = 480, 640
 
-        dummy_shape_h_w = config.tactile_crop_shape if config.tactile_crop_shape is not None else (h, w)
-        dummy_shape = (1, config.tactile_backbone_in_channels, *dummy_shape_h_w)
+        # Determine final input shape to backbone (resize has priority over crop)
+        if config.tactile_resize_shape is not None:
+            final_shape_h_w = config.tactile_resize_shape
+        elif config.tactile_crop_shape is not None:
+            final_shape_h_w = config.tactile_crop_shape
+        else:
+            final_shape_h_w = (h, w)
+        dummy_shape = (1, config.tactile_fused_backbone_in_channels, *final_shape_h_w)
+        # get final out put shape
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
-        self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.tactile_spatial_softmax_num_keypoints)
-        self.feature_dim = config.tactile_spatial_softmax_num_keypoints * 2
-        self.out = nn.Linear(config.tactile_spatial_softmax_num_keypoints * 2, self.feature_dim)
+        # Use spatial softmax to extract keypoints
+        self.spatial_pool = SpatialSoftmax(feature_map_shape, num_kp=config.tactile_spatial_softmax_num_keypoints)
+        # Use global average pooling to extract tactile depth features
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+
+        self.feature_dim = config.tactile_spatial_softmax_num_keypoints * 2 + feature_map_shape[0]
+        self.out = nn.Linear(config.tactile_spatial_softmax_num_keypoints * 2 + feature_map_shape[0], self.feature_dim)
         self.relu = nn.ReLU()
 
     def forward(self, x: Tensor) -> Tensor:
         """
         Args:
-            x: (B, 4, H, W) tactile tensor (depth + normal channels).
+            x: (B, 4, H, W) tactile tensor (normal + depth channels).
         Returns:
             (B, D) tactile feature.
         """
@@ -523,7 +672,17 @@ class TactileVisionEncoder(nn.Module):
             else:
                 x = self.center_crop(x)
 
-        x = torch.flatten(self.pool(self.backbone(x)), start_dim=1)
+        if self.do_resize:
+            x = self.resize(x)
+        
+        x = self.backbone(x)
+
+        # apply sptial pool and avg pool
+        keypoint_coords = torch.flatten(self.spatial_pool(x), start_dim=1)
+        scale_features = torch.flatten(self.global_pool(x), start_dim=1)
+
+        x = torch.cat([keypoint_coords, scale_features], dim=-1)
+
         x = self.relu(self.out(x))
         return x
 
@@ -604,6 +763,12 @@ class DiffusionRgbEncoder(nn.Module):
         else:
             self.do_crop = False
 
+        if config.resize_shape is not None:
+            self.do_resize = True
+            self.resize = torchvision.transforms.Resize(config.resize_shape)
+        else:
+            self.do_resize = False
+
         backbone_model = getattr(torchvision.models, config.vision_backbone)(
             weights=config.pretrained_backbone_weights
         )
@@ -620,10 +785,17 @@ class DiffusionRgbEncoder(nn.Module):
                 func=lambda x: nn.GroupNorm(num_groups=x.num_features // 16, num_channels=x.num_features),
             )
 
-        images_shape = next(iter(config.image_features.values())).shape
-        dummy_shape_h_w = config.crop_shape if config.crop_shape is not None else images_shape[1:]
-        dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
-        feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
+        if config.image_features:
+            images_shape = next(iter(config.image_features.values())).shape
+            # Determine final input shape to backbone (resize has priority over crop)
+            if config.resize_shape is not None:
+                final_shape_h_w = config.resize_shape
+            elif config.crop_shape is not None:
+                final_shape_h_w = config.crop_shape
+            else:
+                final_shape_h_w = images_shape[1:]
+            dummy_shape = (1, images_shape[0], *final_shape_h_w)
+            feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
         self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
         self.feature_dim = config.spatial_softmax_num_keypoints * 2
@@ -636,6 +808,8 @@ class DiffusionRgbEncoder(nn.Module):
                 x = self.maybe_random_crop(x)
             else:
                 x = self.center_crop(x)
+        if self.do_resize:
+            x = self.resize(x)  
 
         x = torch.flatten(self.pool(self.backbone(x)), start_dim=1)
         x = self.relu(self.out(x))

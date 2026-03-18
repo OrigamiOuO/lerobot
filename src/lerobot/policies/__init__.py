@@ -24,7 +24,6 @@ from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
 from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig as WallXConfig
 from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
-from .act_hao.configuration_act_hao import ACTHaoConfig as ACTHaoConfig
 from .diffusion_hao.configuration_diffusion_hao import DiffusionHaoConfig as DiffusionHaoConfig
 
 __all__ = [
