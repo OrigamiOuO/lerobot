@@ -151,10 +151,12 @@ def teleop_loop(
         loop_start = time.perf_counter()
 
         # Get robot observation
-        # Not really needed for now other than for visualization
-        # teleop_action_processor can take None as an observation
-        # given that it is the identity processor as default
-        obs = robot.get_observation()
+        # Full observation (cameras + tactile) is only needed for visualization.
+        # When display_data is off, read only motor state for much higher FPS.
+        if display_data:
+            obs = robot.get_observation()
+        else:
+            obs = None
 
         # Get teleop action
         raw_action = teleop.get_action()

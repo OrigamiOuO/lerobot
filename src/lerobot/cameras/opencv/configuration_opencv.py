@@ -75,6 +75,12 @@ class OpenCVCameraConfig(CameraConfig):
     auto_wb: bool = True
     wb_temperature: int | None = None
 
+    # Gain and brightness settings
+    # gain: sensor gain (0-255), higher = brighter but more noise
+    # brightness: software brightness offset (-64 to 64)
+    gain: int | None = None
+    brightness: int | None = None
+
     def __post_init__(self) -> None:
         if self.color_mode not in (ColorMode.RGB, ColorMode.BGR):
             raise ValueError(

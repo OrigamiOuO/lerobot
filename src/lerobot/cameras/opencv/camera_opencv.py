@@ -339,6 +339,16 @@ class OpenCVCamera(Camera):
                 self._v4l2_set(device_path, "white_balance_temperature", str(self.config.wb_temperature))
                 logger.info(f"{self} white balance temperature set to {self.config.wb_temperature}K")
 
+        # --- Gain ---
+        if self.config.gain is not None:
+            self._v4l2_set(device_path, "gain", str(self.config.gain))
+            logger.info(f"{self} gain set to {self.config.gain}")
+
+        # --- Brightness ---
+        if self.config.brightness is not None:
+            self._v4l2_set(device_path, "brightness", str(self.config.brightness))
+            logger.info(f"{self} brightness set to {self.config.brightness}")
+
     def _v4l2_set(self, device_path: str, control: str, value: str) -> bool:
         """Set a v4l2 control value. Returns True on success."""
         try:
