@@ -69,6 +69,8 @@ from pathlib import Path
 from pprint import pformat
 from typing import Any
 
+import numpy as np
+
 from lerobot.cameras import (  # noqa: F401
     CameraConfig,  # noqa: F401
 )
@@ -206,6 +208,8 @@ class RecordConfig:
     play_sounds: bool = True
     # Resume recording on an existing dataset.
     resume: bool = False
+    # Optional policy observation controls for ablation experiments.
+    observation_control: "ObservationControlConfig" = field(default_factory=lambda: ObservationControlConfig())
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
@@ -224,6 +228,83 @@ class RecordConfig:
     def __get_path_fields__(cls) -> list[str]:
         """This enables the parser to load config from the policy using `--policy.path=local/dir`"""
         return ["policy"]
+
+
+@dataclass
+class ObservationControlConfig:
+    # Enable observation override logic before policy inference.
+    enabled: bool = False
+    # Exact observation key -> replacement value.
+    # Example: {"observation.state": [0.0, ...], "observation.images.front": 0}
+    replacements: dict[str, float | list[float]] = field(default_factory=dict)
+    # Placeholder interface for future replay-from-dataset functionality.
+    replay_source_repo_id: str | None = None
+    replay_start_index: int = 0
+
+
+def _shape_of(value: Any) -> tuple:
+    if isinstance(value, np.ndarray):
+        return value.shape
+    return np.asarray(value).shape
+
+
+def _build_replacement_array(value: Any, target_dtype: Any) -> np.ndarray:
+    if isinstance(value, np.ndarray):
+        return value.astype(target_dtype, copy=False)
+    return np.asarray(value, dtype=target_dtype)
+
+
+def apply_observation_control(
+    observation_frame: dict[str, Any],
+    observation_control: ObservationControlConfig | None,
+) -> dict[str, Any]:
+    """Apply key-wise replacement overrides for policy input observation.
+
+    This function intentionally keeps the replay interface as a placeholder for
+    future extension. For now, only manual key replacements are supported.
+    """
+    if observation_control is None or not observation_control.enabled:
+        return observation_frame
+
+    if observation_control.replay_source_repo_id is not None:
+        logging.info(
+            "Observation replay source '%s' configured but replay is not implemented yet. "
+            "Falling back to live observations.",
+            observation_control.replay_source_repo_id,
+        )
+
+    controlled_observation = dict(observation_frame)
+
+    for key, replacement_value in observation_control.replacements.items():
+        if key not in controlled_observation:
+            logging.warning("Observation replacement key '%s' not found. Skipping.", key)
+            continue
+
+        original_value = controlled_observation[key]
+        original_shape = _shape_of(original_value)
+
+        if isinstance(original_value, np.ndarray):
+            if np.isscalar(replacement_value):
+                replacement_array = np.full_like(original_value, replacement_value)
+            else:
+                replacement_array = _build_replacement_array(replacement_value, original_value.dtype)
+            replacement_shape = replacement_array.shape
+            if replacement_shape != original_shape:
+                raise ValueError(
+                    f"Shape mismatch for observation replacement key '{key}': "
+                    f"original shape={original_shape}, replacement shape={replacement_shape}."
+                )
+            controlled_observation[key] = replacement_array
+        else:
+            replacement_shape = _shape_of(replacement_value)
+            if replacement_shape != original_shape:
+                raise ValueError(
+                    f"Shape mismatch for observation replacement key '{key}': "
+                    f"original shape={original_shape}, replacement shape={replacement_shape}."
+                )
+            controlled_observation[key] = replacement_value
+
+    return controlled_observation
 
 
 """ --------------- record_loop() data flow --------------------------
@@ -279,6 +360,7 @@ def record_loop(
     single_task: str | None = None,
     display_data: bool = False,
     display_compressed_images: bool = False,
+    observation_control: ObservationControlConfig | None = None,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -334,8 +416,9 @@ def record_loop(
 
         # Get action from either policy or teleop
         if policy is not None and preprocessor is not None and postprocessor is not None:
+            policy_observation_frame = apply_observation_control(observation_frame, observation_control)
             action_values = predict_action(
-                observation=observation_frame,
+                observation=policy_observation_frame,
                 policy=policy,
                 device=get_safe_torch_device(policy.config.device),
                 preprocessor=preprocessor,
@@ -506,6 +589,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,
                     display_compressed_images=display_compressed_images,
+                    observation_control=cfg.observation_control,
                 )
 
                 # Execute a few seconds without recording to give time to manually reset the environment
