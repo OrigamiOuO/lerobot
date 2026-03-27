@@ -2,7 +2,7 @@
 
 # Copyright 2024 Columbia Artificial Intelligence, Robotics Lab,
 # and The HuggingFace Inc. team. All rights reserved.
-# Modified for Diffusion-Hao tactile adaptation.
+# Modified for Diffusion-Henry tactile adaptation.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Diffusion-Hao Policy: Diffusion Policy with tactile sensor support.
+"""Diffusion-Henry Policy: Diffusion Policy with tactile sensor support.
 
 Extends the original Diffusion Policy to handle:
 - Standard images (global, inhand, tac_raw) via shared ResNet backbone
@@ -36,7 +36,7 @@ from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from torch import Tensor, nn
 
-from lerobot.policies.diffusion_hao.configuration_diffusion_hao import DiffusionHaoConfig
+from lerobot.policies.diffusion_henry.configuration_diffusion_henry import DiffusionHenryConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import (
     get_device_from_parameters,
@@ -52,18 +52,18 @@ OBS_TAC_RAW = "observation.tac_raw"  # Raw tactile image data
 OBS_TAC_MARKER = "observation.tac_marker"  # Flattened marker displacement
 
 
-class DiffusionHaoPolicy(PreTrainedPolicy):
-    """Diffusion-Hao Policy with tactile sensor support.
+class DiffusionHenryPolicy(PreTrainedPolicy):
+    """Diffusion-Henry Policy with tactile sensor support.
 
     Extends Diffusion Policy to handle tactile depth+normal images and marker displacement data.
     """
 
-    config_class = DiffusionHaoConfig
-    name = "diffusion_hao"
+    config_class = DiffusionHenryConfig
+    name = "diffusion_henry"
 
     def __init__(
         self,
-        config: DiffusionHaoConfig,
+        config: DiffusionHenryConfig,
         **kwargs,
     ):
         """
@@ -77,7 +77,7 @@ class DiffusionHaoPolicy(PreTrainedPolicy):
         # queues are populated during rollout of the policy
         self._queues = None
 
-        self.diffusion = DiffusionHaoModel(config)
+        self.diffusion = DiffusionHenryModel(config)
 
         self.reset()
 
@@ -226,10 +226,10 @@ def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMSche
         raise ValueError(f"Unsupported noise scheduler type {name}")
 
 
-class DiffusionHaoModel(nn.Module):
+class DiffusionHenryModel(nn.Module):
     """Core Diffusion model with tactile sensor support."""
 
-    def __init__(self, config: DiffusionHaoConfig):
+    def __init__(self, config: DiffusionHenryConfig):
         super().__init__()
         self.config = config
 
@@ -279,8 +279,17 @@ class DiffusionHaoModel(nn.Module):
             )
             global_cond_dim += config.tactile_marker_embed_dim
 
-        # === UNet ===
-        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
+        # === Denoiser backbone (UNet / DiT) ===
+        global_cond_total_dim = global_cond_dim * config.n_obs_steps
+        if config.denoiser_type == "unet":
+            denoiser = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_total_dim)
+        elif config.denoiser_type == "dit":
+            denoiser = DiffusionConditionalDiT1d(config, global_cond_dim=global_cond_total_dim)
+        else:
+            raise ValueError(f"Unsupported denoiser type {config.denoiser_type}")
+
+        # Keep `unet` attribute name for compatibility with existing training/inference code paths.
+        self.unet = denoiser
 
         # === Noise scheduler ===
         self.noise_scheduler = _make_noise_scheduler(
@@ -488,7 +497,7 @@ class TactileRawEncoder(nn.Module):
     weights for the RGB channels.
     """
 
-    def __init__(self, config:DiffusionHaoConfig):
+    def __init__(self, config:DiffusionHenryConfig):
         super().__init__()
         self.config = config
 
@@ -563,7 +572,7 @@ class TactileFusedEncoder(nn.Module):
     weights for the RGB channels and mean-initialized weights for the depth channel.
     """
 
-    def __init__(self, config: DiffusionHaoConfig):
+    def __init__(self, config: DiffusionHenryConfig):
         super().__init__()
         self.config = config
 
@@ -750,7 +759,7 @@ class SpatialSoftmax(nn.Module):
 class DiffusionRgbEncoder(nn.Module):
     """Encodes an RGB image into a 1D feature vector."""
 
-    def __init__(self, config: DiffusionHaoConfig):
+    def __init__(self, config: DiffusionHenryConfig):
         super().__init__()
 
         if config.crop_shape is not None:
@@ -877,7 +886,7 @@ class DiffusionConv1dBlock(nn.Module):
 class DiffusionConditionalUnet1d(nn.Module):
     """A 1D convolutional UNet with FiLM modulation for conditioning."""
 
-    def __init__(self, config: DiffusionHaoConfig, global_cond_dim: int):
+    def __init__(self, config: DiffusionHenryConfig, global_cond_dim: int):
         super().__init__()
         self.config = config
 
@@ -972,6 +981,110 @@ class DiffusionConditionalUnet1d(nn.Module):
         x = self.final_conv(x)
         x = einops.rearrange(x, "b d t -> b t d")
         return x
+
+
+def _modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
+    """Apply AdaLN modulation."""
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+class DiffusionDiTBlock1d(nn.Module):
+    """A lightweight DiT block with AdaLN modulation and gated residuals."""
+
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(d_model, 6 * d_model))
+
+    def forward(self, x: Tensor, cond: Tensor) -> Tensor:
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(cond).chunk(6, dim=-1)
+
+        h = _modulate(self.norm1(x), shift_msa, scale_msa)
+        attn_out, _ = self.attn(h, h, h, need_weights=False)
+        x = x + gate_msa.unsqueeze(1) * attn_out
+
+        h = _modulate(self.norm2(x), shift_mlp, scale_mlp)
+        mlp_out = self.mlp(h)
+        x = x + gate_mlp.unsqueeze(1) * mlp_out
+        return x
+
+
+class DiffusionDiTFinalLayer1d(nn.Module):
+    """DiT output layer with AdaLN modulation."""
+
+    def __init__(self, d_model: int, out_dim: int):
+        super().__init__()
+        self.norm_final = nn.LayerNorm(d_model)
+        self.linear = nn.Linear(d_model, out_dim)
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(d_model, 2 * d_model))
+
+    def forward(self, x: Tensor, cond: Tensor) -> Tensor:
+        shift, scale = self.adaLN_modulation(cond).chunk(2, dim=-1)
+        x = _modulate(self.norm_final(x), shift, scale)
+        return self.linear(x)
+
+
+class DiffusionConditionalDiT1d(nn.Module):
+    """DiT-style 1D denoiser for action diffusion."""
+
+    def __init__(self, config: DiffusionHenryConfig, global_cond_dim: int):
+        super().__init__()
+        self.config = config
+
+        self.diffusion_step_encoder = nn.Sequential(
+            DiffusionSinusoidalPosEmb(config.diffusion_step_embed_dim),
+            nn.Linear(config.diffusion_step_embed_dim, config.diffusion_step_embed_dim * 4),
+            nn.Mish(),
+            nn.Linear(config.diffusion_step_embed_dim * 4, config.diffusion_step_embed_dim),
+        )
+
+        cond_dim = config.diffusion_step_embed_dim + global_cond_dim
+        d_model = config.dit_d_model
+
+        self.input_proj = nn.Linear(config.action_feature.shape[0], d_model)
+        self.cond_proj = nn.Sequential(nn.Mish(), nn.Linear(cond_dim, d_model))
+        self.pos_emb = nn.Parameter(torch.zeros(1, config.horizon, d_model))
+
+        self.blocks = nn.ModuleList(
+            [
+                DiffusionDiTBlock1d(
+                    d_model=d_model,
+                    nhead=config.dit_nhead,
+                    dim_feedforward=config.dit_dim_feedforward,
+                    dropout=config.dit_dropout,
+                )
+                for _ in range(config.dit_num_layers)
+            ]
+        )
+        self.final_layer = DiffusionDiTFinalLayer1d(d_model, config.action_feature.shape[0])
+
+        nn.init.normal_(self.pos_emb, std=0.02)
+
+    def forward(self, x: Tensor, timestep: Tensor | int, global_cond: Tensor | None = None) -> Tensor:
+        timesteps_embed = self.diffusion_step_encoder(timestep)
+        if global_cond is not None:
+            global_feature = torch.cat([timesteps_embed, global_cond], axis=-1)
+        else:
+            global_feature = timesteps_embed
+
+        cond = self.cond_proj(global_feature)
+
+        h = self.input_proj(x)
+        h = h + self.pos_emb[:, : h.shape[1]]
+
+        for block in self.blocks:
+            h = block(h, cond)
+
+        return self.final_layer(h, cond)
 
 
 class DiffusionConditionalResidualBlock1d(nn.Module):

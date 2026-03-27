@@ -1,8 +1,8 @@
-# Diffusion-Hao: Tactile-Augmented Diffusion Policy
+# Diffusion-Henry: Tactile-Augmented Diffusion Policy
 
 ## 概述
 
-`diffusion_hao` 是基于原始 Diffusion Policy 的触觉增强版本，专门设计用于处理包含触觉传感器数据的机器人学习任务。
+`diffusion_henry` 是基于原始 Diffusion Policy 的触觉增强版本，专门设计用于处理包含触觉传感器数据的机器人学习任务。
 
 ## 触觉数据支持
 
@@ -64,18 +64,18 @@ tac_marker_displacement (35, 2)
 ## 代码结构
 
 ```
-diffusion_hao/
+diffusion_henry/
 ├── __init__.py
 ├── README.md
-├── configuration_diffusion_hao.py    # 配置类
-└── modeling_diffusion_hao.py         # 模型实现
+├── configuration_diffusion_henry.py    # 配置类
+└── modeling_diffusion_henry.py         # 模型实现
 ```
 
 ## 配置参数
 
 ```python
 @dataclass
-class DiffusionHaoConfig(PreTrainedConfig):
+class DiffusionHenryConfig(PreTrainedConfig):
     # 继承自 DiffusionConfig 的参数...
     
     # === 触觉相关新增参数 ===
@@ -97,16 +97,16 @@ class DiffusionHaoConfig(PreTrainedConfig):
 
 ```bash
 python lerobot/scripts/train.py \
-    --policy.type=diffusion_hao \
+    --policy.type=diffusion_henry \
     --dataset.repo_id=your_tactile_dataset \
-    --output_dir=checkpoints/diffusion_hao
+    --output_dir=checkpoints/diffusion_henry
 ```
 
 ### 配置文件示例
 
 ```yaml
 policy:
-  type: diffusion_hao
+  type: diffusion_henry
   n_obs_steps: 2
   horizon: 16
   n_action_steps: 8

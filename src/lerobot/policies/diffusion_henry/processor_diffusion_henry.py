@@ -2,7 +2,7 @@
 
 # Copyright 2024 Columbia Artificial Intelligence, Robotics Lab,
 # and The HuggingFace Inc. team. All rights reserved.
-# Modified for Diffusion-Hao tactile adaptation.
+# Modified for Diffusion-Henry tactile adaptation.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,13 +15,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Processor for Diffusion-Hao policy."""
+"""Processor for Diffusion-Henry policy."""
 
 from typing import Any
 
 import torch
 
-from lerobot.policies.diffusion_hao.configuration_diffusion_hao import DiffusionHaoConfig
+from lerobot.policies.diffusion_henry.configuration_diffusion_henry import DiffusionHenryConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -35,15 +35,15 @@ from lerobot.processor.converters import policy_action_to_transition, transition
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 
-def make_diffusion_hao_pre_post_processors(
-    config: DiffusionHaoConfig,
+def make_diffusion_henry_pre_post_processors(
+    config: DiffusionHenryConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
     """
-    Constructs pre-processor and post-processor pipelines for diffusion-hao policy.
+    Constructs pre-processor and post-processor pipelines for diffusion-henry policy.
 
     The pre-processing pipeline prepares the input data for the model by:
     1. Renaming features.
@@ -56,7 +56,7 @@ def make_diffusion_hao_pre_post_processors(
     2. Unnormalizing the output features to their original scale.
 
     Args:
-        config: The configuration object for the diffusion-hao policy,
+        config: The configuration object for the diffusion-henry policy,
             containing feature definitions, normalization mappings, and device information.
         dataset_stats: A dictionary of statistics used for normalization.
             Defaults to None.

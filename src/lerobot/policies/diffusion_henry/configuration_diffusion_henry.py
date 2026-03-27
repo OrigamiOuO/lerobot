@@ -2,7 +2,7 @@
 
 # Copyright 2024 Columbia Artificial Intelligence, Robotics Lab,
 # and The HuggingFace Inc. team. All rights reserved.
-# Modified for Diffusion-Hao tactile adaptation.
+# Modified for Diffusion-Henry tactile adaptation.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Configuration class for DiffusionHaoPolicy with tactile sensor support."""
+"""Configuration class for DiffusionHenryPolicy with tactile sensor support."""
 
 from dataclasses import dataclass, field
 
@@ -25,10 +25,10 @@ from lerobot.optim.optimizers import AdamConfig
 from lerobot.optim.schedulers import DiffuserSchedulerConfig
 
 
-@PreTrainedConfig.register_subclass("diffusion_hao")
+@PreTrainedConfig.register_subclass("diffusion_henry")
 @dataclass
-class DiffusionHaoConfig(PreTrainedConfig):
-    """Configuration class for DiffusionHaoPolicy with tactile sensor support.
+class DiffusionHenryConfig(PreTrainedConfig):
+    """Configuration class for DiffusionHenryPolicy with tactile sensor support.
 
     Extends the original Diffusion Policy to handle:
     - Standard images (global, inhand, tac_raw) via shared ResNet backbone
