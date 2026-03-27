@@ -123,9 +123,11 @@ class OpenCVCamera(Camera):
 
         self.thread: Thread | None = None
         self.stop_event: Event | None = None
+        self.capture_lock: Lock = Lock()
         self.frame_lock: Lock = Lock()
         self.latest_frame: NDArray[Any] | None = None
         self.new_frame_event: Event = Event()
+        self.disconnecting = False
 
         self.rotation: int | None = get_cv2_rotation(config.rotation)
         self.backend: int = get_cv2_backend()
@@ -170,6 +172,7 @@ class OpenCVCamera(Camera):
         # Some cameras don't respond to OpenCV's set() calls but work with v4l2-ctl
         self._preconfigure_v4l2()
 
+        self.disconnecting = False
         self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
 
         if not self.videocapture.isOpened():
@@ -505,15 +508,16 @@ class OpenCVCamera(Camera):
                           received frame dimensions don't match expectations before rotation.
             ValueError: If an invalid `color_mode` is requested.
         """
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
-
         start_time = time.perf_counter()
 
-        if self.videocapture is None:
-            raise DeviceNotConnectedError(f"{self} videocapture is not initialized")
+        with self.capture_lock:
+            if not self.is_connected:
+                raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        ret, frame = self.videocapture.read()
+            if self.videocapture is None:
+                raise DeviceNotConnectedError(f"{self} videocapture is not initialized")
+
+            ret, frame = self.videocapture.read()
 
         if not ret or frame is None:
             raise RuntimeError(f"{self} read failed (status={ret}).")
@@ -593,6 +597,8 @@ class OpenCVCamera(Camera):
             except DeviceNotConnectedError:
                 break
             except Exception as e:
+                if self.disconnecting or (self.stop_event is not None and self.stop_event.is_set()):
+                    break
                 logger.warning(f"Error reading frame in background thread for {self}: {e}")
 
     def _start_read_thread(self) -> None:
@@ -680,11 +686,18 @@ class OpenCVCamera(Camera):
         if not self.is_connected and self.thread is None:
             raise DeviceNotConnectedError(f"{self} not connected.")
 
+        self.disconnecting = True
+
         if self.thread is not None:
             self._stop_read_thread()
 
-        if self.videocapture is not None:
-            self.videocapture.release()
-            self.videocapture = None
+        with self.capture_lock:
+            if self.videocapture is not None:
+                self.videocapture.release()
+                self.videocapture = None
+
+        with self.frame_lock:
+            self.latest_frame = None
+        self.new_frame_event.clear()
 
         logger.info(f"{self} disconnected.")
