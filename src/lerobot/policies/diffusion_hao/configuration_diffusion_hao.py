@@ -46,9 +46,9 @@ class DiffusionHaoConfig(PreTrainedConfig):
     """
 
     # Inputs / output structure.
-    n_obs_steps: int = 16
-    horizon: int = 16
-    n_action_steps: int = 8
+    n_obs_steps: int = 2
+    horizon: int = 8
+    n_action_steps: int = 4
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -93,12 +93,20 @@ class DiffusionHaoConfig(PreTrainedConfig):
     tactile_marker_input_dim: int = 70  # 35 markers × 2 coordinates
     tactile_marker_embed_dim: int = 16  # Output dimension (similar to state_dim)
 
+    denoiser_type: str = "dit"  # one of ["unet", "dit"]
     # === Unet ===
     down_dims: tuple[int, ...] = (512, 1024, 2048)
     kernel_size: int = 5
     n_groups: int = 8
     diffusion_step_embed_dim: int = 128
     use_film_scale_modulation: bool = True
+
+    # === DiT ===
+    dit_d_model: int = 512
+    dit_nhead: int = 8
+    dit_num_layers: int = 8
+    dit_dim_feedforward: int = 2048
+    dit_dropout: float = 0.1
 
     # === Noise scheduler ===
     noise_scheduler_type: str = "DDPM"
@@ -151,6 +159,20 @@ class DiffusionHaoConfig(PreTrainedConfig):
                 f"`prediction_type` must be one of {supported_prediction_types}. "
                 f"Got {self.prediction_type}."
             )
+
+        supported_denoiser_types = ["unet", "dit"]
+        if self.denoiser_type not in supported_denoiser_types:
+            raise ValueError(
+                f"`denoiser_type` must be one of {supported_denoiser_types}. "
+                f"Got {self.denoiser_type}."
+            )
+
+        if self.dit_d_model % self.dit_nhead != 0:
+            raise ValueError(
+                "`dit_d_model` must be divisible by `dit_nhead`. "
+                f"Got {self.dit_d_model=} and {self.dit_nhead=}."
+            )
+
         supported_noise_schedulers = ["DDPM", "DDIM"]
         if self.noise_scheduler_type not in supported_noise_schedulers:
             raise ValueError(
@@ -159,12 +181,14 @@ class DiffusionHaoConfig(PreTrainedConfig):
             )
 
         # Check that the horizon size and U-Net downsampling is compatible.
-        downsampling_factor = 2 ** len(self.down_dims)
-        if self.horizon % downsampling_factor != 0:
-            raise ValueError(
-                "The horizon should be an integer multiple of the downsampling factor "
-                f"(which is determined by `len(down_dims)`). Got {self.horizon=} and {self.down_dims=}"
-            )
+        # Transformer/DiT denoisers do not impose this constraint.
+        if self.denoiser_type == "unet":
+            downsampling_factor = 2 ** len(self.down_dims)
+            if self.horizon % downsampling_factor != 0:
+                raise ValueError(
+                    "The horizon should be an integer multiple of the downsampling factor "
+                    f"(which is determined by `len(down_dims)`). Got {self.horizon=} and {self.down_dims=}"
+                )
 
     def get_optimizer_preset(self) -> AdamConfig:
         return AdamConfig(
