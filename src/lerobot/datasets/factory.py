@@ -27,12 +27,36 @@ from lerobot.datasets.lerobot_dataset import (
 )
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 from lerobot.datasets.transforms import ImageTransforms
-from lerobot.utils.constants import ACTION, OBS_PREFIX, REWARD
+from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_PREFIX, REWARD
 
 IMAGENET_STATS = {
     "mean": [[[0.485]], [[0.456]], [[0.406]]],  # (c,1,1)
     "std": [[[0.229]], [[0.224]], [[0.225]]],  # (c,1,1)
 }
+
+
+def _resolve_required_observation_keys(
+    cfg: PreTrainedConfig, ds_meta: LeRobotDatasetMetadata
+) -> set[str] | None:
+    """Return a policy-specific observation allowlist when available.
+
+    Returning None means "no restriction" and preserves the previous behavior.
+    """
+    # Multi-state diffusion variants explicitly declare the observation keys they consume.
+    state_feature_keys = getattr(cfg, "state_feature_keys", None)
+    if not state_feature_keys:
+        return None
+
+    required: set[str] = {
+        key for key in state_feature_keys if isinstance(key, str) and key in ds_meta.features
+    }
+
+    # Preserve visual and environment-state conditioning when present in the dataset.
+    required.update(ds_meta.camera_keys)
+    if OBS_ENV_STATE in ds_meta.features:
+        required.add(OBS_ENV_STATE)
+
+    return required
 
 
 def resolve_delta_timestamps(
@@ -54,12 +78,18 @@ def resolve_delta_timestamps(
             returns `None` if the resulting dict is empty.
     """
     delta_timestamps = {}
+    required_observation_keys = _resolve_required_observation_keys(cfg, ds_meta)
+
     for key in ds_meta.features:
         if key == REWARD and cfg.reward_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
         if key == ACTION and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
-        if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
+        if (
+            key.startswith(OBS_PREFIX)
+            and cfg.observation_delta_indices is not None
+            and (required_observation_keys is None or key in required_observation_keys)
+        ):
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
 
     if len(delta_timestamps) == 0:

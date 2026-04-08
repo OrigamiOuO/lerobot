@@ -1,0 +1,2 @@
+训练指令：
+lerobot-train      --dataset.repo_id=grasp_multi     --dataset.root=datasets/luo_proj/Blind_Grasping_LeRobot_Multimodal    --policy.type=pretrain_diffusion     --output_dir=./checkpoints/luo_proj/pretrain_dp_test     --policy.repo_id=pretrain_diffusion  --batch_size=4     --num_workers=1     --policy.use_amp=true --steps=10  --wandb.enable=true --policy.push_to_hub=false --save_freq=5000  --job_name=pretrain_dp_test

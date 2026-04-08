@@ -184,6 +184,9 @@ datasets/
 # checkpoints
 checkpoints/
 
+# Model weights
+*.pth
+
 # results
 results/
 

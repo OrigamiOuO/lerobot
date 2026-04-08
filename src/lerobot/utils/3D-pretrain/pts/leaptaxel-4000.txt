@@ -1,0 +1,1 @@
+{"fingertip": [111, 119], "fingertip_2": [111, 119], "fingertip_3": [111, 119], "thumb_fingertip": [232, 240]}

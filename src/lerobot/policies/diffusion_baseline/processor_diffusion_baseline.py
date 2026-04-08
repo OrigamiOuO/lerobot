@@ -29,8 +29,30 @@ from lerobot.processor import (
     RenameObservationsProcessorStep,
     UnnormalizerProcessorStep,
 )
+from lerobot.processor.pipeline import ObservationProcessorStep
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
+from lerobot.utils.constants import OBS_ENV_STATE
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+
+
+class KeepObservationKeysProcessorStep(ObservationProcessorStep):
+    """Drop observation entries that are not consumed by the policy."""
+
+    def __init__(self, keep_keys: list[str]):
+        self.keep_keys = set(keep_keys)
+
+    def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
+        return {k: v for k, v in observation.items() if k in self.keep_keys}
+
+    def transform_features(self, features: dict) -> dict:
+        transformed = dict(features)
+        if "observation" in transformed:
+            transformed_observation = dict(transformed["observation"])
+            transformed_observation = {
+                k: v for k, v in transformed_observation.items() if k in self.keep_keys
+            }
+            transformed["observation"] = transformed_observation
+        return transformed
 
 
 def make_diffusion_baseline_pre_post_processors(
@@ -63,8 +85,16 @@ def make_diffusion_baseline_pre_post_processors(
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
 
+    required_observation_keys = [
+        key for key in config.state_feature_keys if key in config.input_features
+    ]
+    required_observation_keys.extend(list(config.image_features.keys()))
+    if config.env_state_feature is not None:
+        required_observation_keys.append(OBS_ENV_STATE)
+
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
+        KeepObservationKeysProcessorStep(keep_keys=required_observation_keys),
         AddBatchDimensionProcessorStep(),
         DeviceProcessorStep(device=config.device),
         NormalizerProcessorStep(

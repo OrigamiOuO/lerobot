@@ -104,9 +104,9 @@ class DiffusionConfig(PreTrainedConfig):
     """
 
     # Inputs / output structure.
-    n_obs_steps: int = 2
-    horizon: int = 16
-    n_action_steps: int = 8
+    n_obs_steps: int = 5
+    horizon: int = 8
+    n_action_steps: int = 3
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {

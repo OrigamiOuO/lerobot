@@ -30,12 +30,10 @@ from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.envs.configs import EnvConfig
 from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
-from lerobot.policies.act_hao.configuration_tactile_act import TactileACTConfig as ActHaoConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
-from lerobot.policies.tactile_act.configuration_tactile_act import TactileACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
@@ -89,10 +87,6 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.act.modeling_act import ACTPolicy
 
         return ACTPolicy
-    elif name == "act_hao":
-        from lerobot.policies.act_hao.modeling_tactile_act import TactileACTPolicy
-
-        return TactileACTPolicy
     elif name == "vqbet":
         from lerobot.policies.vqbet.modeling_vqbet import VQBeTPolicy
 
@@ -141,14 +135,11 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.tactile_diffusion.modeling_tactile_diffusion import TactileDiffusionPolicy
 
         return TactileDiffusionPolicy
-    elif name == "tactile_blind_diffusion":
-        from lerobot.policies.tactile_blind_diffusion.modeling_tactile_blind_diffusion import TactileDiffusionPolicy
+    
+    elif name == "pretrain_diffusion":
+        from lerobot.policies.pretrain_diffusion.modeling_pretrain_diffusion import PretrainDiffusionPolicy
 
-        return TactileDiffusionPolicy
-    elif name == "tactile_act":
-        from lerobot.policies.tactile_act.modeling_tactile_act import TactileACTPolicy
-
-        return TactileACTPolicy
+        return PretrainDiffusionPolicy
     else:
         try:
             return _get_policy_cls_from_policy_name(name=name)
@@ -325,22 +316,6 @@ def make_pre_post_processors(
         from lerobot.policies.act.processor_act import make_act_pre_post_processors
 
         processors = make_act_pre_post_processors(
-            config=policy_cfg,
-            dataset_stats=kwargs.get("dataset_stats"),
-        )
-
-    elif isinstance(policy_cfg, ActHaoConfig):
-        from lerobot.policies.act_hao.processor_tactile_act import make_tactile_act_hao_pre_post_processors
-
-        processors = make_tactile_act_hao_pre_post_processors(
-            config=policy_cfg,
-            dataset_stats=kwargs.get("dataset_stats"),
-        )
-
-    elif isinstance(policy_cfg, TactileACTConfig):
-        from lerobot.policies.tactile_act.processor_tactile_act import make_tactile_act_pre_post_processors
-
-        processors = make_tactile_act_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
