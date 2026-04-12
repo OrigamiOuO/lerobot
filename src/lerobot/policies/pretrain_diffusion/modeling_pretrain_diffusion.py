@@ -26,8 +26,8 @@ from torch import Tensor, nn
 
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionConditionalUnet1d
 from lerobot.policies.pretrain_diffusion.configuration_pretrain_diffusion import PretrainDiffusionConfig
-from lerobot.policies.pretrain_diffusion.pretrain_encoder.temporal_tactile_encoder import (
-    PretrainedSparsePCEncoder,
+from lerobot.policies.pretrain_diffusion.pretrain_encoder_v2.temporal_tactile_encoder_v2 import (
+    PretrainedSparsePCEncoderV2,
 )
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import get_device_from_parameters, get_dtype_from_parameters, populate_queues
@@ -117,11 +117,11 @@ class PretrainDiffusionModel(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        self.sparse_pc_encoder = PretrainedSparsePCEncoder(
+        self.sparse_pc_encoder = PretrainedSparsePCEncoderV2(
             checkpoint_path=config.resolve_pretrained_encoder_ckpt_path(),
-            seq_len=config.n_obs_steps,
+            max_seq_len=config.pretrained_encoder_max_seq_len,
             num_points=config.sparse_pc_num_points,
-            in_dim=config.sparse_pc_point_dim,
+            point_dim=config.sparse_pc_point_dim,
             embed_dim=config.pretrained_encoder_embed_dim,
             freeze=config.freeze_pretrained_encoder,
         )

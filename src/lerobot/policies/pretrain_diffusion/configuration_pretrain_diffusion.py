@@ -72,8 +72,9 @@ class PretrainDiffusionConfig(PreTrainedConfig):
     sparse_pc_num_points: int = 44
     sparse_pc_point_dim: int = 4
     pretrained_encoder_embed_dim: int = 384
+    pretrained_encoder_max_seq_len: int = 16
     pretrained_encoder_ckpt_path: str = (
-        "src/lerobot/policies/pretrain_diffusion/pretrain_encoder/latest_geometry_ckpt.pth"
+        "src/lerobot/policies/pretrain_diffusion/pretrain_encoder_v2/latest_geometry_ckpt.pth"
     )
     freeze_pretrained_encoder: bool = True
 
