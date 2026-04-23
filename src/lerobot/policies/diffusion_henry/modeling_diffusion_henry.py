@@ -226,12 +226,126 @@ def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMSche
         raise ValueError(f"Unsupported noise scheduler type {name}")
 
 
+class MultiModalConsensusMoE(nn.Module):
+    """Multi-modal consensus MoE block.
+
+    This module projects modality features into a shared latent space, applies
+    expert routing per modality, then computes a weighted consensus across
+    modalities for each observation step.
+    """
+
+    def __init__(
+        self,
+        modality_input_dims: dict[str, int],
+        hidden_dim: int,
+        num_experts: int,
+        dropout: float,
+        routing_dropout: float,
+        topk: int,
+    ):
+        super().__init__()
+        self.modality_names = tuple(modality_input_dims.keys())
+        self.hidden_dim = hidden_dim
+        self.num_experts = num_experts
+        self.routing_dropout = routing_dropout
+        self.topk = topk
+
+        self.modality_projectors = nn.ModuleDict(
+            {name: nn.Linear(in_dim, hidden_dim) for name, in_dim in modality_input_dims.items()}
+        )
+
+        self.experts = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_dim, hidden_dim),
+                )
+                for _ in range(num_experts)
+            ]
+        )
+
+        self.router = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_experts),
+        )
+        self.modality_score = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.out_norm = nn.LayerNorm(hidden_dim)
+
+    @staticmethod
+    def _dropout_and_renorm(weights: Tensor, p: float) -> Tensor:
+        """Apply dropout to mixture weights and renormalize along the last dim."""
+        if p <= 0.0:
+            return weights
+
+        keep_mask = (torch.rand_like(weights) > p).to(weights.dtype)
+        dropped = weights * keep_mask
+        denom = dropped.sum(dim=-1, keepdim=True)
+        fallback = 1.0 / weights.shape[-1]
+        renorm = torch.where(denom > 0, dropped / denom.clamp_min(1e-12), torch.full_like(weights, fallback))
+        return renorm
+
+    def forward(self, modality_features: dict[str, Tensor]) -> Tensor:
+        """Compute consensus feature.
+
+        Args:
+            modality_features: maps modality name -> tensor of shape (B, S, D_i).
+
+        Returns:
+            Consensus feature tensor of shape (B, S, hidden_dim).
+        """
+        expert_outputs = []
+        modality_logits = []
+
+        for name in self.modality_names:
+            x = self.modality_projectors[name](modality_features[name])  # (B, S, H)
+
+            routing_logits = self.router(x)  # (B, S, E)
+            routing_weights = F.softmax(routing_logits, dim=-1)
+            if self.training and self.routing_dropout > 0.0:
+                routing_weights = self._dropout_and_renorm(routing_weights, self.routing_dropout)
+
+            stacked_expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=2)  # (B, S, E, H)
+            mixed = (routing_weights.unsqueeze(-1) * stacked_expert_outputs).sum(dim=2)  # (B, S, H)
+
+            expert_outputs.append(mixed)
+            modality_logits.append(self.modality_score(mixed))
+
+        modality_stack = torch.stack(expert_outputs, dim=2)  # (B, S, M, H)
+        modality_logits = torch.cat(modality_logits, dim=2)  # (B, S, M)
+
+        k = min(self.topk, modality_logits.shape[-1])
+        if k < modality_logits.shape[-1]:
+            topk_vals, topk_idx = torch.topk(modality_logits, k=k, dim=-1)
+            masked_logits = torch.full_like(modality_logits, float("-inf"))
+            masked_logits.scatter_(-1, topk_idx, topk_vals)
+            modality_weights = F.softmax(masked_logits, dim=-1)
+        else:
+            modality_weights = F.softmax(modality_logits, dim=-1)
+
+        if self.training and self.routing_dropout > 0.0:
+            modality_weights = self._dropout_and_renorm(modality_weights, self.routing_dropout)
+
+        consensus = (modality_weights.unsqueeze(-1) * modality_stack).sum(dim=2)  # (B, S, H)
+        return self.out_norm(consensus)
+
+
 class DiffusionHenryModel(nn.Module):
     """Core Diffusion model with tactile sensor support."""
 
     def __init__(self, config: DiffusionHenryConfig):
         super().__init__()
         self.config = config
+        self.use_denoiser_moe = config.use_denoiser_moe
+        self.denoiser_composition_strategy = config.denoiser_composition_strategy
+        self.denoiser_num_modules = config.denoiser_num_modules
+        self.denoiser_topk = config.denoiser_topk
 
         # Keep tactile raw/depth/normal out of the RGB branch when they are video/image features.
         self._tactile_depth_keys = list(self.config.tactile_depth_features.keys())
@@ -245,6 +359,7 @@ class DiffusionHenryModel(nn.Module):
         # Build observation encoders
         # Start with robot state dimension
         global_cond_dim = self.config.robot_state_feature.shape[0]
+        self._modality_dims: dict[str, int] = {"state": self.config.robot_state_feature.shape[0]}
 
         # === Standard image encoder (shared for visual images and tac_raw) ===
         if len(self._rgb_image_keys) > 0:
@@ -253,23 +368,33 @@ class DiffusionHenryModel(nn.Module):
                 encoders = [DiffusionRgbEncoder(config) for _ in range(num_images)]
                 self.rgb_encoder = nn.ModuleList(encoders)
                 global_cond_dim += encoders[0].feature_dim * num_images
+                rgb_total_dim = encoders[0].feature_dim * num_images
             else:
                 self.rgb_encoder = DiffusionRgbEncoder(config)
                 global_cond_dim += self.rgb_encoder.feature_dim * num_images
+                rgb_total_dim = self.rgb_encoder.feature_dim * num_images
+            self._modality_dims["rgb"] = rgb_total_dim
 
         # === Environment state (if present) ===
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
+            self._modality_dims["env_state"] = self.config.env_state_feature.shape[0]
 
         # === Environment
         if self.config.has_tactile_raw:
             self.tactile_raw_encoder = TactileRawEncoder(config)
-            global_cond_dim += self.tactile_raw_encoder.feature_dim
+            num_tactile_raw = len(self._tactile_raw_keys)
+            tactile_raw_total_dim = self.tactile_raw_encoder.feature_dim * num_tactile_raw
+            global_cond_dim += tactile_raw_total_dim
+            self._modality_dims["tactile_raw"] = tactile_raw_total_dim
 
         # === Tactile depth/normal encoder (for depth + normal 4-channel data) ===
         if self.config.has_tactile_fused:
             self.tactile_fused_encoder = TactileFusedEncoder(config)
-            global_cond_dim += self.tactile_fused_encoder.feature_dim
+            num_tactile_fused = min(len(self._tactile_depth_keys), len(self._tactile_normal_keys))
+            tactile_fused_total_dim = self.tactile_fused_encoder.feature_dim * num_tactile_fused
+            global_cond_dim += tactile_fused_total_dim
+            self._modality_dims["tactile_fused"] = tactile_fused_total_dim
 
         # === Tactile marker encoder (for marker displacement) ===
         if self.config.has_tactile_marker:
@@ -278,18 +403,63 @@ class DiffusionHenryModel(nn.Module):
                 embed_dim=config.tactile_marker_embed_dim,
             )
             global_cond_dim += config.tactile_marker_embed_dim
+            self._modality_dims["tactile_marker"] = config.tactile_marker_embed_dim
+
+        # === Optional MoE consensus over modalities ===
+        if config.use_modal_moe:
+            self.modal_moe = MultiModalConsensusMoE(
+                modality_input_dims=self._modality_dims,
+                hidden_dim=config.moe_hidden_dim,
+                num_experts=config.moe_num_experts,
+                dropout=config.moe_dropout,
+                routing_dropout=config.moe_routing_dropout,
+                topk=config.moe_topk,
+            )
+            global_cond_dim += config.moe_hidden_dim
+        else:
+            self.modal_moe = None
 
         # === Denoiser backbone (UNet / DiT) ===
         global_cond_total_dim = global_cond_dim * config.n_obs_steps
         if config.denoiser_type == "unet":
-            denoiser = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_total_dim)
+            denoiser_ctor = lambda cond_dim: DiffusionConditionalUnet1d(config, global_cond_dim=cond_dim)
         elif config.denoiser_type == "dit":
-            denoiser = DiffusionConditionalDiT1d(config, global_cond_dim=global_cond_total_dim)
+            denoiser_ctor = lambda cond_dim: DiffusionConditionalDiT1d(config, global_cond_dim=cond_dim)
         else:
             raise ValueError(f"Unsupported denoiser type {config.denoiser_type}")
 
-        # Keep `unet` attribute name for compatibility with existing training/inference code paths.
-        self.unet = denoiser
+        if self.use_denoiser_moe:
+            self._expert_modalities = [name for name in self._modality_dims.keys() if name != "state"]
+            if len(self._expert_modalities) == 0:
+                raise ValueError(
+                    "`use_denoiser_moe=True` requires at least one non-state modality feature."
+                )
+
+            # Expert condition uses [state + modality] per observation step.
+            self._expert_cond_dims = {
+                name: (self._modality_dims["state"] + self._modality_dims[name]) * config.n_obs_steps
+                for name in self._expert_modalities
+            }
+
+            self.denoiser_experts = nn.ModuleList()
+            for name in self._expert_modalities:
+                self.denoiser_experts.extend(
+                    [denoiser_ctor(self._expert_cond_dims[name]) for _ in range(self.denoiser_num_modules)]
+                )
+
+            self.weight_predictor = nn.Sequential(
+                nn.Linear(global_cond_total_dim, global_cond_total_dim),
+                nn.ReLU(),
+                nn.Linear(global_cond_total_dim, len(self.denoiser_experts)),
+            )
+
+            # Compatibility handle; MoE path does not call this directly.
+            self.unet = self.denoiser_experts
+        else:
+            denoiser = denoiser_ctor(global_cond_total_dim)
+
+            # Keep `unet` attribute name for compatibility with existing training/inference code paths.
+            self.unet = denoiser
 
         # === Noise scheduler ===
         self.noise_scheduler = _make_noise_scheduler(
@@ -308,10 +478,84 @@ class DiffusionHenryModel(nn.Module):
         else:
             self.num_inference_steps = config.num_inference_steps
 
+    def _expert_cond_for_expert(
+        self,
+        expert_idx: int,
+        modality_conds: list[Tensor],
+    ) -> Tensor:
+        modality_idx = expert_idx // self.denoiser_num_modules
+        return modality_conds[modality_idx]
+
+    def _predict_with_denoiser_moe(
+        self,
+        trajectory: Tensor,
+        timestep: Tensor,
+        modality_conds: list[Tensor],
+        weights: Tensor,
+    ) -> Tensor:
+        """Predict denoising output with expert composition.
+
+        Args:
+            trajectory: (B, T, Da)
+            timestep: (B,) long tensor
+            modality_conds: list of per-modality conditions, each (B, Dm)
+            weights: (num_experts, B)
+        """
+        batch_size = trajectory.shape[0]
+
+        if self.denoiser_composition_strategy == "soft_gating":
+            norm_weights = F.softmax(weights, dim=0)
+            pred = sum(
+                norm_weights[i][:, None, None]
+                * expert(trajectory, timestep, global_cond=self._expert_cond_for_expert(i, modality_conds))
+                for i, expert in enumerate(self.denoiser_experts)
+            )
+            return pred
+
+        if self.denoiser_composition_strategy == "hard_routing":
+            idx = torch.argmax(weights, dim=0)  # (B,)
+            pred = torch.stack(
+                [
+                    self.denoiser_experts[i](
+                        trajectory[b : b + 1],
+                        timestep[b : b + 1],
+                        global_cond=self._expert_cond_for_expert(i, modality_conds)[b : b + 1],
+                    )
+                    for b, i in enumerate(idx)
+                ]
+            ).squeeze(1)
+            return pred
+
+        if self.denoiser_composition_strategy == "topk_moe":
+            k = min(self.denoiser_topk, len(self.denoiser_experts))
+            topk_vals, topk_idx = torch.topk(weights, k=k, dim=0)  # (k, B)
+            norm_weights = F.softmax(topk_vals, dim=0)  # (k, B)
+            pred = torch.zeros_like(trajectory)
+
+            for j in range(k):
+                idx = topk_idx[j]  # (B,)
+                w = norm_weights[j]  # (B,)
+                for b in range(batch_size):
+                    i = idx[b].item()
+                    cond_i = self._expert_cond_for_expert(i, modality_conds)
+                    pred[b] += (
+                        w[b]
+                        * self.denoiser_experts[i](
+                            trajectory[b : b + 1],
+                            timestep[b : b + 1],
+                            global_cond=cond_i[b : b + 1],
+                        ).squeeze(0)
+                    )
+            return pred
+
+        raise ValueError(f"Unknown denoiser composition strategy {self.denoiser_composition_strategy}")
+
     def conditional_sample(
         self,
         batch_size: int,
         global_cond: Tensor | None = None,
+        modality_conds: list[Tensor] | None = None,
+        weights: Tensor | None = None,
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
     ) -> Tensor:
@@ -334,19 +578,38 @@ class DiffusionHenryModel(nn.Module):
         self.noise_scheduler.set_timesteps(self.num_inference_steps)
 
         for t in self.noise_scheduler.timesteps:
-            model_output = self.unet(
-                sample,
-                torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
-                global_cond=global_cond,
-            )
+            timestep = torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device)
+            if self.use_denoiser_moe:
+                assert modality_conds is not None and weights is not None
+                model_output = self._predict_with_denoiser_moe(
+                    sample,
+                    timestep=timestep,
+                    modality_conds=modality_conds,
+                    weights=weights,
+                )
+            else:
+                model_output = self.unet(
+                    sample,
+                    timestep,
+                    global_cond=global_cond,
+                )
             sample = self.noise_scheduler.step(model_output, t, sample, generator=generator).prev_sample
 
         return sample
 
-    def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
-        """Encode all features and concatenate them for global conditioning."""
+    def _prepare_global_conditioning(
+        self,
+        batch: dict[str, Tensor],
+        return_modality_conds: bool = False,
+    ) -> Tensor | tuple[Tensor, list[Tensor]]:
+        """Encode all features and concatenate them for global conditioning.
+
+        When `return_modality_conds=True`, also returns per-modality expert
+        conditions in the same modality order as `self._expert_modalities`.
+        """
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
         global_cond_feats = [batch[OBS_STATE]]
+        modality_features: dict[str, Tensor] = {"state": batch[OBS_STATE]}
 
         # === Extract standard image features ===
         if len(self._rgb_image_keys) > 0:
@@ -369,10 +632,12 @@ class DiffusionHenryModel(nn.Module):
                     img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
                 )
             global_cond_feats.append(img_features)
+            modality_features["rgb"] = img_features
 
         # === Extract environment state features ===
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV_STATE])
+            modality_features["env_state"] = batch[OBS_ENV_STATE]
 
         # === Extract tactile raw features ===
         if self.config.has_tactile_raw:
@@ -394,6 +659,7 @@ class DiffusionHenryModel(nn.Module):
                     raw_features_stacked, "(n b s) d -> b s (n d)", b=batch_size, s=n_obs_steps, n=num_raw
                 )
             global_cond_feats.append(tac_raw_features)
+            modality_features["tactile_raw"] = tac_raw_features
 
         # === Extract tactile fused features (depth + normal) ===
         if self.config.has_tactile_fused:
@@ -416,23 +682,53 @@ class DiffusionHenryModel(nn.Module):
                     fused_features_stacked, "(n b s) d -> b s (n d)", b=batch_size, s=n_obs_steps, n=num_fused
                 )
             global_cond_feats.append(tac_fused_features)
+            modality_features["tactile_fused"] = tac_fused_features
 
         # === Extract tactile marker features ===
         if self.config.has_tactile_marker:
             tac_marker = batch[OBS_TAC_MARKER]  # (B, n_obs_steps, 70)
             tac_marker_features = self.tactile_marker_encoder(tac_marker)  # (B, n_obs_steps, embed_dim)
             global_cond_feats.append(tac_marker_features)
+            modality_features["tactile_marker"] = tac_marker_features
+
+        if self.modal_moe is not None:
+            consensus_features = self.modal_moe(modality_features)
+            global_cond_feats.append(consensus_features)
 
         # Concatenate features then flatten to (B, global_cond_dim).
-        return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
+        global_cond = torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
+
+        if not return_modality_conds:
+            return global_cond
+
+        if not self.use_denoiser_moe:
+            return global_cond, []
+
+        state_feat = modality_features["state"]
+        modality_conds = [
+            torch.cat([modality_features[name], state_feat], dim=-1).flatten(start_dim=1)
+            for name in self._expert_modalities
+        ]
+        return global_cond, modality_conds
 
     def generate_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """Generate actions given observations."""
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
         assert n_obs_steps == self.config.n_obs_steps
 
-        global_cond = self._prepare_global_conditioning(batch)
-        actions = self.conditional_sample(batch_size, global_cond=global_cond, noise=noise)
+        if self.use_denoiser_moe:
+            global_cond, modality_conds = self._prepare_global_conditioning(batch, return_modality_conds=True)
+            weights = self.weight_predictor(global_cond).transpose(0, 1)
+            actions = self.conditional_sample(
+                batch_size,
+                global_cond=global_cond,
+                modality_conds=modality_conds,
+                weights=weights,
+                noise=noise,
+            )
+        else:
+            global_cond = self._prepare_global_conditioning(batch)
+            actions = self.conditional_sample(batch_size, global_cond=global_cond, noise=noise)
 
         # Extract n_action_steps worth of actions
         start = n_obs_steps - 1
@@ -444,7 +740,9 @@ class DiffusionHenryModel(nn.Module):
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
         """Compute training loss."""
         # Input validation
-        assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
+        assert set(batch).issuperset({OBS_STATE, ACTION})
+        if self.config.do_mask_loss_for_padding:
+            assert "action_is_pad" in batch
 
         n_obs_steps = batch[OBS_STATE].shape[1]
         horizon = batch[ACTION].shape[1]
@@ -452,7 +750,11 @@ class DiffusionHenryModel(nn.Module):
         assert n_obs_steps == self.config.n_obs_steps
 
         # Prepare global conditioning
-        global_cond = self._prepare_global_conditioning(batch)
+        if self.use_denoiser_moe:
+            global_cond, modality_conds = self._prepare_global_conditioning(batch, return_modality_conds=True)
+            weights = self.weight_predictor(global_cond).transpose(0, 1)
+        else:
+            global_cond = self._prepare_global_conditioning(batch)
 
         # Forward diffusion
         trajectory = batch[ACTION]
@@ -466,7 +768,15 @@ class DiffusionHenryModel(nn.Module):
         noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
 
         # Run denoising network
-        pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
+        if self.use_denoiser_moe:
+            pred = self._predict_with_denoiser_moe(
+                noisy_trajectory,
+                timestep=timesteps,
+                modality_conds=modality_conds,
+                weights=weights,
+            )
+        else:
+            pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
 
         # Compute loss
         if self.config.prediction_type == "epsilon":
@@ -480,11 +790,6 @@ class DiffusionHenryModel(nn.Module):
 
         # Mask loss for padded actions
         if self.config.do_mask_loss_for_padding:
-            if "action_is_pad" not in batch:
-                raise ValueError(
-                    "You need to provide 'action_is_pad' in the batch when "
-                    f"{self.config.do_mask_loss_for_padding=}."
-                )
             in_episode_bound = ~batch["action_is_pad"]
             loss = loss * in_episode_bound.unsqueeze(-1)
 
