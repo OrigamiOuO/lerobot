@@ -1070,7 +1070,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if self.image_transforms is not None:
             image_keys = self.meta.camera_keys
             for cam in image_keys:
-                item[cam] = self.image_transforms(item[cam])
+                if not hasattr(self.image_transforms, "should_apply") or self.image_transforms.should_apply(cam):
+                    item[cam] = self.image_transforms(item[cam])
 
         # Add task as a string
         task_idx = item["task_index"].item()
@@ -1514,6 +1515,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
             if isinstance(episode_index, np.ndarray):
                 episode_index = episode_index.item() if episode_index.size == 1 else episode_index[0]
             for cam_key in self.meta.image_keys:
+                img_dir = self._get_image_file_dir(episode_index, cam_key)
+                if img_dir.is_dir():
+                    shutil.rmtree(img_dir)
+            for cam_key in self.meta.video_keys:
                 img_dir = self._get_image_file_dir(episode_index, cam_key)
                 if img_dir.is_dir():
                     shutil.rmtree(img_dir)

@@ -173,6 +173,9 @@ class ImageTransformsConfig:
 
     # Set this flag to `true` to enable transforms during training
     enable: bool = False
+    # Restrict transforms to specific visual keys. Entries can be full keys like
+    # `observation.images.global` or suffixes like `global`.
+    apply_to: list[str] | None = None
     # This is the maximum number of transforms (sampled from these below) that will be applied to each frame.
     # It's an integer in the interval [1, number_of_available_transforms].
     max_num_transforms: int = 3
@@ -234,6 +237,7 @@ class ImageTransforms(Transform):
     def __init__(self, cfg: ImageTransformsConfig) -> None:
         super().__init__()
         self._cfg = cfg
+        self.apply_to = list(cfg.apply_to) if cfg.apply_to else None
 
         self.weights = []
         self.transforms = {}
@@ -257,3 +261,9 @@ class ImageTransforms(Transform):
 
     def forward(self, *inputs: Any) -> Any:
         return self.tf(*inputs)
+
+    def should_apply(self, key: str) -> bool:
+        if self.apply_to is None:
+            return True
+
+        return any(key == candidate or key.endswith(f".{candidate}") for candidate in self.apply_to)

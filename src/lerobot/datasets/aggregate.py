@@ -20,6 +20,8 @@ import shutil
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import tqdm
 
 from lerobot.datasets.compute_stats import aggregate_stats
@@ -407,17 +409,37 @@ def aggregate_data(src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_si
         src_path = src_meta.root / DEFAULT_DATA_PATH.format(
             chunk_index=src_chunk_idx, file_index=src_file_idx
         )
-        df = pd.read_parquet(src_path)
-        df = update_data_df(df, src_meta, dst_meta)
+        src_table = pq.read_table(src_path)
 
-        data_idx = append_or_create_parquet_file(
-            df,
+        # Update indices directly on pyarrow table (avoids pandas conversion issues
+        # with nested list columns like tac_marker_displacement)
+        import pyarrow.compute as pc
+        src_table = src_table.set_column(
+            src_table.schema.get_field_index("episode_index"),
+            "episode_index",
+            pc.add(src_table.column("episode_index"), dst_meta.info["total_episodes"]),
+        )
+        src_table = src_table.set_column(
+            src_table.schema.get_field_index("index"),
+            "index",
+            pc.add(src_table.column("index"), dst_meta.info["total_frames"]),
+        )
+        # Remap task_index
+        src_task_names = src_meta.tasks.index.take(src_table.column("task_index").to_pylist())
+        new_task_indices = dst_meta.tasks.loc[src_task_names, "task_index"].to_numpy()
+        src_table = src_table.set_column(
+            src_table.schema.get_field_index("task_index"),
+            "task_index",
+            pa.array(new_task_indices, type=pa.int64()),
+        )
+
+        data_idx = append_or_create_parquet_file_arrow(
+            src_table,
             src_path,
             data_idx,
             data_files_size_in_mb,
             chunk_size,
             DEFAULT_DATA_PATH,
-            contains_images=len(dst_meta.image_keys) > 0,
             aggr_root=dst_meta.root,
         )
 
@@ -488,6 +510,7 @@ def append_or_create_parquet_file(
     default_path: str,
     contains_images: bool = False,
     aggr_root: Path = None,
+    arrow_schema: pa.Schema | None = None,
 ):
     """Appends data to an existing parquet file or creates a new one based on size constraints.
 
@@ -513,6 +536,9 @@ def append_or_create_parquet_file(
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         if contains_images:
             to_parquet_with_hf_images(df, dst_path)
+        elif arrow_schema is not None:
+            table = pa.Table.from_pandas(df, schema=arrow_schema, preserve_index=False)
+            pq.write_table(table, dst_path)
         else:
             df.to_parquet(dst_path)
         return idx
@@ -533,8 +559,47 @@ def append_or_create_parquet_file(
 
     if contains_images:
         to_parquet_with_hf_images(final_df, target_path)
+    elif arrow_schema is not None:
+        table = pa.Table.from_pandas(final_df, schema=arrow_schema, preserve_index=False)
+        pq.write_table(table, target_path)
     else:
         final_df.to_parquet(target_path)
+
+    return idx
+
+
+def append_or_create_parquet_file_arrow(
+    table: pa.Table,
+    src_path: Path,
+    idx: dict[str, int],
+    max_mb: float,
+    chunk_size: int,
+    default_path: str,
+    aggr_root: Path = None,
+):
+    """Like append_or_create_parquet_file but operates on pyarrow Tables directly.
+
+    Avoids pandas conversion issues with nested list columns (e.g. tac_marker_displacement).
+    """
+    dst_path = aggr_root / default_path.format(chunk_index=idx["chunk"], file_index=idx["file"])
+
+    if not dst_path.exists():
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(table, dst_path)
+        return idx
+
+    src_size = get_parquet_file_size_in_mb(src_path)
+    dst_size = get_parquet_file_size_in_mb(dst_path)
+
+    if dst_size + src_size >= max_mb:
+        idx["chunk"], idx["file"] = update_chunk_file_indices(idx["chunk"], idx["file"], chunk_size)
+        new_path = aggr_root / default_path.format(chunk_index=idx["chunk"], file_index=idx["file"])
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(table, new_path)
+    else:
+        existing_table = pq.read_table(dst_path)
+        combined = pa.concat_tables([existing_table, table], promote_options="default")
+        pq.write_table(combined, dst_path)
 
     return idx
 

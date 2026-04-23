@@ -94,6 +94,9 @@ class SOFollower(Robot):
         self.tactile_processor = None
         self.marker_tracker = None
 
+        # Persistent thread pool for parallel camera reads (avoid per-frame creation overhead)
+        self._obs_executor: ThreadPoolExecutor | None = None
+
     @property
     def _motors_ft(self) -> dict[str, type]:
         return {f"{motor}.pos": float for motor in self.bus.motors}
@@ -310,30 +313,32 @@ class SOFollower(Robot):
             logger.debug(f"{self} read tactile '{name}': {dt_ms:.1f}ms")
             return tactile_data
         
-        # Use ThreadPoolExecutor for parallel reads
+        # Use persistent ThreadPoolExecutor for parallel reads (avoid per-frame creation overhead)
         max_workers = len(self.cameras) + len(self.tactile_cameras)
         if max_workers > 0:
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = []
-                
-                # Submit camera read tasks
-                for cam_key, cam in self.cameras.items():
-                    futures.append(executor.submit(read_camera, cam_key, cam))
-                
-                # Submit tactile camera read tasks
-                for name, tactile_cam in self.tactile_cameras.items():
-                    futures.append(executor.submit(read_tactile, name, tactile_cam))
-                
-                # Collect results
-                for future in as_completed(futures):
-                    result = future.result()
-                    if isinstance(result, tuple) and len(result) == 2:
-                        # Camera result: (key, frame)
-                        cam_key, frame = result
-                        obs_dict[cam_key] = frame
-                    elif isinstance(result, dict):
-                        # Tactile result: dict
-                        obs_dict.update(result)
+            if self._obs_executor is None:
+                self._obs_executor = ThreadPoolExecutor(max_workers=max_workers)
+
+            futures = []
+            
+            # Submit camera read tasks
+            for cam_key, cam in self.cameras.items():
+                futures.append(self._obs_executor.submit(read_camera, cam_key, cam))
+            
+            # Submit tactile camera read tasks
+            for name, tactile_cam in self.tactile_cameras.items():
+                futures.append(self._obs_executor.submit(read_tactile, name, tactile_cam))
+            
+            # Collect results
+            for future in as_completed(futures):
+                result = future.result()
+                if isinstance(result, tuple) and len(result) == 2:
+                    # Camera result: (key, frame)
+                    cam_key, frame = result
+                    obs_dict[cam_key] = frame
+                elif isinstance(result, dict):
+                    # Tactile result: dict
+                    obs_dict.update(result)
         
         dt_all_ms = (time.perf_counter() - start_all) * 1e3
         logger.debug(f"{self} parallel read all cameras: {dt_all_ms:.1f}ms")
@@ -511,6 +516,9 @@ class SOFollower(Robot):
 
     @check_if_not_connected
     def disconnect(self):
+        if self._obs_executor is not None:
+            self._obs_executor.shutdown(wait=False)
+            self._obs_executor = None
         try:
             self.bus.disconnect(self.config.disable_torque_on_disconnect)
         except RuntimeError as e:
