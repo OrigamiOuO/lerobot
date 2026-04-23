@@ -1518,6 +1518,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 img_dir = self._get_image_file_dir(episode_index, cam_key)
                 if img_dir.is_dir():
                     shutil.rmtree(img_dir)
+            for cam_key in self.meta.video_keys:
+                img_dir = self._get_image_file_dir(episode_index, cam_key)
+                if img_dir.is_dir():
+                    shutil.rmtree(img_dir)
 
         # Reset the buffer
         self.episode_buffer = self.create_episode_buffer()

@@ -49,7 +49,7 @@ class DiffusionHaoConfig(PreTrainedConfig):
     use_tactile: bool = True
 
     # Inputs / output structure.
-    n_obs_steps: int = 4
+    n_obs_steps: int = 2
     horizon: int = 8
     n_action_steps: int = 4
 

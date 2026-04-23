@@ -481,6 +481,27 @@ def record_loop(
 
         timestamp = time.perf_counter() - start_episode_t
 
+#每次录制之前都在这里重置触觉传感器，等待其准备就绪，避免在录制开始后才发现触觉数据不正常
+def reset_tactile_before_episode(robot: Robot, events: dict, timeout_s: float = 10.0) -> None:
+    reset_tactile = getattr(robot, "reset_tactile", None)
+    if not callable(reset_tactile):
+        return
+
+    reset_tactile()
+
+    ready_deadline = time.perf_counter() + timeout_s
+    while not events["stop_recording"]:
+        tactile_ready = getattr(robot, "tactile_ready", True)
+        if tactile_ready:
+            logging.info("Tactile sensor reset completed and background collection is ready.")
+            return
+
+        if time.perf_counter() >= ready_deadline:
+            logging.warning("Timed out waiting for tactile sensors to finish background collection.")
+            return
+
+        robot.get_observation()
+
 
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
@@ -572,6 +593,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                reset_tactile_before_episode(robot, events)
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
                 record_loop(
                     robot=robot,
