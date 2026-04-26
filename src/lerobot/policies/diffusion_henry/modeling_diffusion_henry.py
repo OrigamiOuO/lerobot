@@ -242,6 +242,8 @@ class MultiModalConsensusMoE(nn.Module):
         dropout: float,
         routing_dropout: float,
         topk: int,
+        debug_inference: bool = False,
+        debug_every_n_calls: int = 1,
     ):
         super().__init__()
         self.modality_names = tuple(modality_input_dims.keys())
@@ -249,6 +251,10 @@ class MultiModalConsensusMoE(nn.Module):
         self.num_experts = num_experts
         self.routing_dropout = routing_dropout
         self.topk = topk
+        self.debug_inference = debug_inference
+        self.debug_every_n_calls = debug_every_n_calls
+        self._inference_call_count = 0
+        self.last_inference_routing: dict[str, list[float] | list[str] | int] | None = None
 
         self.modality_projectors = nn.ModuleDict(
             {name: nn.Linear(in_dim, hidden_dim) for name, in_dim in modality_input_dims.items()}
@@ -332,6 +338,31 @@ class MultiModalConsensusMoE(nn.Module):
         if self.training and self.routing_dropout > 0.0:
             modality_weights = self._dropout_and_renorm(modality_weights, self.routing_dropout)
 
+        if (not self.training) and self.debug_inference:
+            self._inference_call_count += 1
+            mean_weights = modality_weights.detach().mean(dim=(0, 1))
+            report_k = min(self.topk, mean_weights.shape[0])
+            topk_weights, topk_idx = torch.topk(mean_weights, k=report_k, dim=0)
+
+            topk_modalities = [self.modality_names[i] for i in topk_idx.tolist()]
+            topk_weights_list = topk_weights.cpu().tolist()
+            all_modalities = list(self.modality_names)
+            all_weights = mean_weights.cpu().tolist()
+
+            self.last_inference_routing = {
+                "call": self._inference_call_count,
+                "topk_modalities": topk_modalities,
+                "topk_weights": topk_weights_list,
+                "all_modalities": all_modalities,
+                "all_weights": all_weights,
+            }
+
+            if self._inference_call_count % self.debug_every_n_calls == 0:
+                topk_pairs = ", ".join(
+                    [f"{m}:{w:.4f}" for m, w in zip(topk_modalities, topk_weights_list, strict=True)]
+                )
+                print(f"[modal_moe] call={self._inference_call_count} topk={topk_pairs}")
+
         consensus = (modality_weights.unsqueeze(-1) * modality_stack).sum(dim=2)  # (B, S, H)
         return self.out_norm(consensus)
 
@@ -414,6 +445,8 @@ class DiffusionHenryModel(nn.Module):
                 dropout=config.moe_dropout,
                 routing_dropout=config.moe_routing_dropout,
                 topk=config.moe_topk,
+                debug_inference=config.modal_moe_debug_inference,
+                debug_every_n_calls=config.modal_moe_debug_every_n_calls,
             )
             global_cond_dim += config.moe_hidden_dim
         else:
@@ -477,6 +510,12 @@ class DiffusionHenryModel(nn.Module):
             self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
         else:
             self.num_inference_steps = config.num_inference_steps
+
+    def get_modal_moe_debug_info(self) -> dict[str, list[float] | list[str] | int] | None:
+        """Return latest modal MoE routing summary captured during inference."""
+        if self.modal_moe is None:
+            return None
+        return self.modal_moe.last_inference_routing
 
     def _expert_cond_for_expert(
         self,

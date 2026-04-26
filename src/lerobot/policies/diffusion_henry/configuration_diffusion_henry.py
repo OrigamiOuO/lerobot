@@ -97,12 +97,14 @@ class DiffusionHenryConfig(PreTrainedConfig):
     tactile_marker_embed_dim: int = 16  # Output dimension (similar to state_dim)
 
     # === Optional multi-modal consensus MoE ===
-    use_modal_moe: bool = False
+    use_modal_moe: bool = True
     moe_num_experts: int = 2
     moe_hidden_dim: int = 256
     moe_dropout: float = 0.1
     moe_routing_dropout: float = 0.1
     moe_topk: int = 2
+    modal_moe_debug_inference: bool = False
+    modal_moe_debug_every_n_calls: int = 1
 
     # === Optional denoiser-level MoE (dp_unets_spec-style) ===
     # Build multiple denoiser experts per non-state modality and combine their
@@ -205,6 +207,11 @@ class DiffusionHenryConfig(PreTrainedConfig):
                 )
             if self.moe_topk < 1:
                 raise ValueError(f"`moe_topk` must be >= 1. Got {self.moe_topk}.")
+            if self.modal_moe_debug_every_n_calls < 1:
+                raise ValueError(
+                    "`modal_moe_debug_every_n_calls` must be >= 1. "
+                    f"Got {self.modal_moe_debug_every_n_calls}."
+                )
 
         if self.use_denoiser_moe:
             if self.denoiser_num_modules < 1:
