@@ -89,7 +89,7 @@ class DiffusionHenryConfig(PreTrainedConfig):
     # TODO: add different encoder for tactile depth and tactile normal instead of fusing them as 4-channel input to a single backbone
     # === Tactile vision backbone (for tac_depth + tac_normal 4-channel data) ===
     tactile_fused_backbone: str = "resnet18"
-    tactile_fused_backbone_in_channels: int = 4  # depth(3) + normal(1)
+    tactile_fused_backbone_in_channels: int = 4  # depth(1) + normal(3)
     tactile_fused_pretrained_backbone_weights: str | None = None
 
     # === Tactile marker encoder ===
@@ -97,22 +97,27 @@ class DiffusionHenryConfig(PreTrainedConfig):
     tactile_marker_embed_dim: int = 16  # Output dimension (similar to state_dim)
 
     # === Optional multi-modal consensus MoE ===
-    use_modal_moe: bool = True
+    use_modal_moe: bool = False
     moe_num_experts: int = 2
     moe_hidden_dim: int = 256
     moe_dropout: float = 0.1
     moe_routing_dropout: float = 0.1
     moe_topk: int = 2
-    modal_moe_debug_inference: bool = False
-    modal_moe_debug_every_n_calls: int = 1
+    modal_moe_debug_inference: bool = True
+    modal_moe_debug_every_n_calls: int = 5
+    modal_moe_debug_print_full_weights: bool = True
 
     # === Optional denoiser-level MoE (dp_unets_spec-style) ===
     # Build multiple denoiser experts per non-state modality and combine their
     # predictions with learned routing weights.
-    use_denoiser_moe: bool = False
+    use_denoiser_moe: bool = True
     denoiser_num_modules: int = 2
-    denoiser_composition_strategy: str = "soft_gating"  # one of ["soft_gating", "hard_routing", "topk_moe"]
+    denoiser_composition_strategy: str = "topk_moe"  # one of ["soft_gating", "hard_routing", "topk_moe"]
     denoiser_topk: int = 2
+    denoiser_grouping_strategy: str = "semantic"  # one of ["modality", "semantic"]
+    denoiser_moe_debug_inference: bool = True
+    denoiser_moe_debug_every_n_calls: int = 5
+    denoiser_moe_debug_print_full_weights: bool = True
 
     denoiser_type: str = "dit"  # one of ["unet", "dit"]
     # === Unet ===
@@ -228,6 +233,29 @@ class DiffusionHenryConfig(PreTrainedConfig):
 
             if self.denoiser_topk < 1:
                 raise ValueError(f"`denoiser_topk` must be >= 1. Got {self.denoiser_topk}.")
+
+            if self.denoiser_moe_debug_every_n_calls < 1:
+                raise ValueError(
+                    "`denoiser_moe_debug_every_n_calls` must be >= 1. "
+                    f"Got {self.denoiser_moe_debug_every_n_calls}."
+                )
+
+            supported_grouping = ["modality", "semantic"]
+            if self.denoiser_grouping_strategy not in supported_grouping:
+                raise ValueError(
+                    "`denoiser_grouping_strategy` must be one of "
+                    f"{supported_grouping}. Got {self.denoiser_grouping_strategy}."
+                )
+
+        # Tactile fused stream expects one-to-one depth/normal sensor pairing.
+        depth_count = len(self.tactile_depth_features)
+        normal_count = len(self.tactile_normal_features)
+        if depth_count != normal_count:
+            raise ValueError(
+                "Tactile depth/normal feature count mismatch: "
+                f"got {depth_count} depth streams vs {normal_count} normal streams. "
+                "Please provide paired depth+normal keys per tactile sensor."
+            )
 
         supported_noise_schedulers = ["DDPM", "DDIM"]
         if self.noise_scheduler_type not in supported_noise_schedulers:
