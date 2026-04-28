@@ -40,10 +40,6 @@ __all__ = [
     "GrootConfig",
     "XVLAConfig",
     "WallXConfig",
-    "TactileDiffusionConfig",
-    "TactileBlindDiffusionConfig",
-    "TactileACTConfig",
-    "ACTHaoConfig",
     "DiffusionHaoConfig",
     "DiffusionHenryConfig",
 ]
