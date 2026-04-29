@@ -25,6 +25,7 @@ import numpy as np
 from lerobot.cameras.utils import make_cameras_from_configs
 from lerobot.cameras.tactile_cam.tactile_camera import TactileCamera
 from lerobot.cameras.tactile_cam.gelsight_marker_tracker import GelSightMarkerTracker
+from lerobot.cameras.tactile_cam.visualization import draw_marker_arrows
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.feetech import (
     FeetechMotorsBus,
@@ -463,6 +464,14 @@ class SOFollower(Robot):
             f"tac_depth.{name}": depth,
             f"tac_normal.{name}": normal,
             f"tac_marker_displacement.{name}": marker_displacement,
+            # 仅用于实时可视化（不写入数据集），叠加了 marker 箭头的原始图
+            f"tac_marker_vis.{name}": draw_marker_arrows(
+                warped_frame_rgb,
+                tracker,
+                scale=6.0,
+                threshold=self._marker_threshold,
+                input_rgb=True,
+            ),
         }
 
     def reset_tactile(self):

@@ -121,6 +121,74 @@ def visualize_diff(current: np.ndarray, reference: np.ndarray,
     return diff_display
 
 
+def draw_marker_arrows(
+    frame: np.ndarray,
+    tracker,
+    scale: float = 6.0,
+    threshold: float = 0.5,
+    input_rgb: bool = True,
+) -> np.ndarray:
+    """在帧上绘制 marker 位移箭头，返回 RGB uint8 图像。
+
+    Args:
+        frame: 输入图像，RGB 或 BGR uint8 (H, W, 3)。
+        tracker: GelSightMarkerTracker 实例。
+        scale: 位移放大倍数，用于可视化。
+        threshold: 低于此幅值（像素）的位移视为静止，只画圆点。
+        input_rgb: True 表示输入为 RGB，False 表示输入为 BGR。
+
+    Returns:
+        RGB uint8 图像，与输入同尺寸，已叠加箭头标注。
+    """
+    if tracker is None:
+        return frame.copy() if input_rgb else cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    # 统一转为 BGR 在上面画图，最后再转回 RGB 输出
+    if input_rgb:
+        vis = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    else:
+        vis = frame.copy()
+
+    if tracker.flowcenter is None or len(tracker.flowcenter) == 0:
+        return cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+    if tracker.markerU is None or tracker.markerV is None:
+        return cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+
+    centers = np.around(tracker.flowcenter[:, 0:2]).astype(np.int32)
+    displacements_u = tracker.markerU
+    displacements_v = tracker.markerV
+    total_d = np.sqrt(displacements_u ** 2 + displacements_v ** 2)
+    avg_d = float(np.mean(total_d))
+    max_d = float(np.max(total_d))
+    moving = int(np.sum(total_d > threshold))
+
+    for i in range(min(tracker.MarkerCount, len(centers))):
+        if i >= len(displacements_u):
+            break
+        cx, cy = int(centers[i, 0]), int(centers[i, 1])
+        dx, dy = float(displacements_u[i]), float(displacements_v[i])
+        mag = float(np.sqrt(dx ** 2 + dy ** 2))
+        if mag < threshold:
+            cv2.circle(vis, (cx, cy), 2, (0, 255, 0), -1)
+        else:
+            ex = int(cx + dx * scale)
+            ey = int(cy + dy * scale)
+            cv2.arrowedLine(vis, (cx, cy), (ex, ey), (0, 255, 255), 2, tipLength=0.2)
+            cv2.circle(vis, (cx, cy), 3, (0, 0, 255), -1)
+
+    cv2.putText(
+        vis,
+        f"N:{tracker.MarkerCount}  Avg:{avg_d:.2f}  Max:{max_d:.2f}  Moving:{moving}",
+        (10, 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 255, 255),
+        1,
+    )
+
+    return cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+
+
 class TactileVisualizer:
     """
     触觉传感器可视化器

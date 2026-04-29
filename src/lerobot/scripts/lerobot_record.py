@@ -405,6 +405,31 @@ def record_loop(
             events["exit_early"] = False
             break
 
+        # Handle R-key tactile reset: reset and wait until background is ready,
+        # keeping the robot moving but skipping dataset recording during this window.
+        if events.get("reset_tactile", False):
+            events["reset_tactile"] = False
+            reset_tactile_fn = getattr(robot, "reset_tactile", None)
+            if callable(reset_tactile_fn):
+                reset_tactile_fn()
+                logging.info("Tactile sensor reset triggered by R key. Pausing recording until ready...")
+                print("\n[TAC] Resetting... recording paused", flush=True)
+                # Drain frames until tactile is ready (keep sending teleop actions so arm doesn't freeze)
+                while not events["exit_early"] and not events["stop_recording"]:
+                    tactile_ready = getattr(robot, "tactile_ready", True)
+                    if tactile_ready:
+                        break
+                    _drain_obs = robot.get_observation()
+                    if isinstance(teleop, Teleoperator):
+                        _drain_act = teleop_action_processor((teleop.get_action(), _drain_obs))
+                        robot_action_processor((_drain_act, _drain_obs))
+                        robot.send_action(_drain_act)
+                    dt_s = time.perf_counter() - start_loop_t
+                    precise_sleep(max(1 / fps - dt_s, 0.0))
+                    start_loop_t = time.perf_counter()
+                logging.info("Tactile sensor ready. Resuming recording.")
+                print("[TAC] Ready. Recording resumed.", flush=True)
+
         # Get robot observation
         obs = robot.get_observation()
 
@@ -475,6 +500,18 @@ def record_loop(
             log_rerun_data(
                 observation=obs_processed, action=action_values, compress_images=display_compressed_images
             )
+
+        # 实时打印触觉传感器的 marker 位移均值和深度均值
+        tac_parts = []
+        for k, v in obs_processed.items():
+            if k.startswith("tac_marker_displacement.") and isinstance(v, np.ndarray):
+                mag = np.sqrt(v[:, 0] ** 2 + v[:, 1] ** 2) if v.ndim == 2 and v.shape[1] >= 2 else np.abs(v)
+                tac_parts.append(f"{k[len('tac_marker_displacement.'):]}_disp={float(np.mean(mag)):.3f}px")
+            elif k.startswith("tac_depth.") and isinstance(v, np.ndarray):
+                # depth stored as uint8 (0-255); report raw mean in pixel units
+                tac_parts.append(f"{k[len('tac_depth.'):]}_depth={float(np.mean(v)):.2f}")
+        if tac_parts:
+            print("\r[TAC] " + "  |  ".join(tac_parts), end="", flush=True)
 
         dt_s = time.perf_counter() - start_loop_t
         precise_sleep(max(1 / fps - dt_s, 0.0))

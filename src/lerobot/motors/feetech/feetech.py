@@ -295,8 +295,11 @@ class FeetechMotorsBus(MotorsBus):
 
     def disable_torque(self, motors: str | list[str] | None = None, num_retry: int = 0) -> None:
         for motor in self._get_motors_list(motors):
-            self.write("Torque_Enable", motor, TorqueMode.DISABLED.value, num_retry=num_retry)
-            self.write("Lock", motor, 0, num_retry=num_retry)
+            try:
+                self.write("Torque_Enable", motor, TorqueMode.DISABLED.value, num_retry=num_retry)
+                self.write("Lock", motor, 0, num_retry=num_retry)
+            except ConnectionError as e:
+                logger.warning(f"Failed to disable torque on motor '{motor}': {e}")
 
     def _disable_torque(self, motor_id: int, model: str, num_retry: int = 0) -> None:
         addr, length = get_address(self.model_ctrl_table, model, "Torque_Enable")
