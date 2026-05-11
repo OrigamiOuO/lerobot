@@ -98,6 +98,39 @@ def resolve_delta_timestamps(
     return delta_timestamps
 
 
+def _resolve_required_dataset_columns(
+    cfg: TrainPipelineConfig,
+    ds_meta: LeRobotDatasetMetadata,
+    delta_timestamps: dict[str, list] | None,
+) -> set[str] | None:
+    """Resolve an optional dataset column allowlist used to avoid loading unused heavy fields."""
+    if not cfg.filter_unused_dataset_columns:
+        return None
+
+    required_observation_keys = _resolve_required_observation_keys(cfg.policy, ds_meta)
+    if required_observation_keys is None:
+        return None
+
+    required_columns: set[str] = set(required_observation_keys)
+
+    # Action is needed for supervised policy training.
+    if ACTION in ds_meta.features:
+        required_columns.add(ACTION)
+    if REWARD in ds_meta.features:
+        required_columns.add(REWARD)
+
+    # Core indexing/meta keys used by __getitem__ and downstream training utilities.
+    for key in ["timestamp", "frame_index", "episode_index", "index", "task_index"]:
+        if key in ds_meta.features:
+            required_columns.add(key)
+
+    # Keep all keys required by temporal sampling logic when delta timestamps are enabled.
+    if delta_timestamps is not None:
+        required_columns.update(delta_timestamps.keys())
+
+    return required_columns
+
+
 def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDataset:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
@@ -119,6 +152,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+        required_columns = _resolve_required_dataset_columns(cfg, ds_meta, delta_timestamps)
         if not cfg.dataset.streaming:
             dataset = LeRobotDataset(
                 cfg.dataset.repo_id,
@@ -129,6 +163,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 revision=cfg.dataset.revision,
                 video_backend=cfg.dataset.video_backend,
                 tolerance_s=cfg.tolerance_s,
+                required_columns=required_columns,
             )
         else:
             dataset = StreamingLeRobotDataset(

@@ -565,6 +565,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         force_cache_sync: bool = False,
         download_videos: bool = True,
         video_backend: str | None = None,
+        required_columns: list[str] | set[str] | None = None,
         batch_encoding_size: int = 1,
         vcodec: str = "libsvtav1",
     ):
@@ -694,6 +695,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.tolerance_s = tolerance_s
         self.revision = revision if revision else CODEBASE_VERSION
         self.video_backend = video_backend if video_backend else get_safe_default_codec()
+        self.required_columns = set(required_columns) if required_columns is not None else None
         self.delta_indices = None
         self.batch_encoding_size = batch_encoding_size
         self.episodes_since_last_encoding = 0
@@ -859,7 +861,18 @@ class LeRobotDataset(torch.utils.data.Dataset):
     def load_hf_dataset(self) -> datasets.Dataset:
         """hf_dataset contains all the observations, states, actions, rewards, etc."""
         features = get_hf_features_from_features(self.features)
-        hf_dataset = load_nested_dataset(self.root / "data", features=features, episodes=self.episodes)
+        # Resolve column projection list: intersect required_columns with actually available columns
+        # so that parquet reads only the necessary columns (avoids loading large unused features).
+        load_columns = None
+        if self.required_columns is not None:
+            available = set(features.keys()) if features is not None else set()
+            load_columns = sorted(self.required_columns & available)
+            missing_columns = sorted(self.required_columns - available)
+            if missing_columns:
+                logging.warning("Ignoring missing required dataset columns: %s", missing_columns)
+        hf_dataset = load_nested_dataset(
+            self.root / "data", features=features, episodes=self.episodes, columns=load_columns
+        )
         hf_dataset.set_transform(hf_transform_to_torch)
         return hf_dataset
 

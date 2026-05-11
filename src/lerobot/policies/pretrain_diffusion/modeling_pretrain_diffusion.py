@@ -68,14 +68,9 @@ class PretrainDiffusionPolicy(PreTrainedPolicy):
         return self.diffusion.parameters()
 
     def reset(self):
-        self._queues = {
-            ACTION: deque(maxlen=self.config.n_action_steps),
-            OBS_STATE: deque(maxlen=self.config.n_obs_steps),
-            OBS_STATE_VELOCITY: deque(maxlen=self.config.n_obs_steps),
-            OBS_TACTILE: deque(maxlen=self.config.n_obs_steps),
-            OBS_FSR: deque(maxlen=self.config.n_obs_steps),
-            OBS_SPARSE_PC: deque(maxlen=self.config.n_obs_steps),
-        }
+        self._queues = {ACTION: deque(maxlen=self.config.n_action_steps)}
+        for key in self.config.active_obs_keys:
+            self._queues[key] = deque(maxlen=self.config.n_obs_steps)
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
@@ -109,7 +104,7 @@ class PretrainDiffusionModel(nn.Module):
         self.config = config
 
         self.state_mlp = nn.Sequential(
-            nn.Linear(config.state_fused_input_dim, config.state_mlp_hidden_dim1),
+            nn.Linear(config.effective_state_fused_input_dim, config.state_mlp_hidden_dim1),
             nn.ReLU(inplace=True),
             nn.Linear(config.state_mlp_hidden_dim1, config.state_mlp_hidden_dim2),
             nn.ReLU(inplace=True),
@@ -117,17 +112,19 @@ class PretrainDiffusionModel(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        self.sparse_pc_encoder = PretrainedSparsePCEncoderV2(
-            checkpoint_path=config.resolve_pretrained_encoder_ckpt_path(),
-            max_seq_len=config.pretrained_encoder_max_seq_len,
-            num_points=config.sparse_pc_num_points,
-            point_dim=config.sparse_pc_point_dim,
-            embed_dim=config.pretrained_encoder_embed_dim,
-            freeze=config.freeze_pretrained_encoder,
-        )
+        if config.ablation_mode == "full":
+            self.sparse_pc_encoder = PretrainedSparsePCEncoderV2(
+                checkpoint_path=config.resolve_pretrained_encoder_ckpt_path(),
+                max_seq_len=config.pretrained_encoder_max_seq_len,
+                num_points=config.sparse_pc_num_points,
+                point_dim=config.sparse_pc_point_dim,
+                embed_dim=config.pretrained_encoder_embed_dim,
+                freeze=config.freeze_pretrained_encoder,
+            )
+        else:
+            self.sparse_pc_encoder = None
 
-        global_cond_dim = config.state_mlp_output_dim + config.pretrained_encoder_embed_dim
-        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim)
+        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=config.global_cond_dim)
 
         self.noise_scheduler = _make_noise_scheduler(
             config.noise_scheduler_type,
@@ -146,25 +143,27 @@ class PretrainDiffusionModel(nn.Module):
             self.num_inference_steps = config.num_inference_steps
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
-        state = batch[OBS_STATE]
-        state_velocity = batch[OBS_STATE_VELOCITY]
-        tactile = batch[OBS_TACTILE]
-        fsr = batch[OBS_FSR]
-        sparse_pc = batch[OBS_SPARSE_PC]
+        parts = [batch[OBS_STATE], batch[OBS_STATE_VELOCITY]]
+        if self.config.ablation_mode in ("full", "no_fsr"):
+            parts.append(batch[OBS_TACTILE])
+        if self.config.ablation_mode in ("full", "no_twintac"):
+            parts.append(batch[OBS_FSR])
 
-        fused_state = torch.cat([state, state_velocity, tactile, fsr], dim=-1)
-        if fused_state.shape[-1] != self.config.state_fused_input_dim:
+        fused_state = torch.cat(parts, dim=-1)
+        expected = self.config.effective_state_fused_input_dim
+        if fused_state.shape[-1] != expected:
             raise ValueError(
-                f"Expected fused state dim {self.config.state_fused_input_dim}, got {fused_state.shape[-1]}"
+                f"Expected fused state dim {expected} (ablation_mode={self.config.ablation_mode!r}), "
+                f"got {fused_state.shape[-1]}"
             )
 
-        state_latents = self.state_mlp(fused_state)
-        state_latent = state_latents.mean(dim=1)
+        state_latent = self.state_mlp(fused_state).mean(dim=1)
 
-        sparse_tokens = self.sparse_pc_encoder(sparse_pc)
-        sparse_latent = sparse_tokens.mean(dim=1)
+        if self.config.ablation_mode == "full":
+            sparse_latent = self.sparse_pc_encoder(batch[OBS_SPARSE_PC]).mean(dim=1)
+            return torch.cat([state_latent, sparse_latent], dim=-1)
 
-        return torch.cat([state_latent, sparse_latent], dim=-1)
+        return state_latent
 
     def conditional_sample(
         self,
@@ -210,15 +209,7 @@ class PretrainDiffusionModel(nn.Module):
         return actions[:, start:end]
 
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
-        required_keys = {
-            OBS_STATE,
-            OBS_STATE_VELOCITY,
-            OBS_TACTILE,
-            OBS_FSR,
-            OBS_SPARSE_PC,
-            ACTION,
-            "action_is_pad",
-        }
+        required_keys = set(self.config.active_obs_keys) | {ACTION, "action_is_pad"}
         assert set(batch).issuperset(required_keys)
 
         n_obs_steps = batch[OBS_STATE].shape[1]

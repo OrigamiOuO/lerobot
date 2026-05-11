@@ -52,6 +52,9 @@ class TrainPipelineConfig(HubMixin):
     seed: int | None = 1000
     # Number of workers for the dataloader.
     num_workers: int = 4
+    dataloader_prefetch_factor: int = 2
+    dataloader_persistent_workers: bool = True
+    filter_unused_dataset_columns: bool = True
     batch_size: int = 8
     steps: int = 100_000
     eval_freq: int = 20_000
@@ -138,6 +141,11 @@ class TrainPipelineConfig(HubMixin):
         if self.policy.push_to_hub and not self.policy.repo_id:
             raise ValueError(
                 "'policy.repo_id' argument missing. Please specify it to push the model to the hub."
+            )
+
+        if self.dataloader_prefetch_factor < 1:
+            raise ValueError(
+                f"dataloader_prefetch_factor must be >= 1, got {self.dataloader_prefetch_factor}."
             )
 
         if self.use_rabc and not self.rabc_progress_path:

@@ -62,7 +62,20 @@ class PretrainDiffusionConfig(PreTrainedConfig):
     hand_pc_feature_key: str = "observation.hand_pc"
     cube_pos_feature_key: str = "cube_pos"
 
+    # Ablation mode for baseline experiments.
+    # "full"       : all modalities (default)
+    # "no_tactile" : remove tactile + FSR + sparse_pc (state + velocity only)
+    # "no_twintac" : remove TwinTac tactile (first 32-dim) + sparse_pc, keep FSR
+    # "no_fsr"     : remove FSR (last 12-dim) + sparse_pc, keep TwinTac tactile
+    ablation_mode: str = "full"
+
+    # Per-modality dims used to derive effective MLP input when ablating.
+    tactile_dim: int = 32  # dim of observation.tactile  (TwinTac)
+    fsr_dim: int = 12      # dim of observation.fsr
+
     # State fusion MLP dimensions.
+    # state_fused_input_dim should always reflect the FULL concat dim (88);
+    # effective_state_fused_input_dim is derived automatically from ablation_mode.
     state_fused_input_dim: int = 88
     state_mlp_hidden_dim1: int = 128
     state_mlp_hidden_dim2: int = 256
@@ -112,6 +125,12 @@ class PretrainDiffusionConfig(PreTrainedConfig):
     def __post_init__(self):
         super().__post_init__()
 
+        supported_ablation_modes = ["full", "no_tactile", "no_twintac", "no_fsr"]
+        if self.ablation_mode not in supported_ablation_modes:
+            raise ValueError(
+                f"`ablation_mode` must be one of {supported_ablation_modes}. Got {self.ablation_mode}."
+            )
+
         supported_prediction_types = ["epsilon", "sample"]
         if self.prediction_type not in supported_prediction_types:
             raise ValueError(
@@ -131,6 +150,44 @@ class PretrainDiffusionConfig(PreTrainedConfig):
                 "The horizon should be an integer multiple of the downsampling factor (which is determined "
                 f"by `len(down_dims)`). Got {self.horizon=} and {self.down_dims=}"
             )
+
+    @property
+    def effective_state_fused_input_dim(self) -> int:
+        """Actual MLP input dim after removing modalities according to ablation_mode."""
+        if self.ablation_mode == "full":
+            return self.state_fused_input_dim
+        elif self.ablation_mode == "no_tactile":
+            return self.state_fused_input_dim - self.tactile_dim - self.fsr_dim
+        elif self.ablation_mode == "no_twintac":
+            return self.state_fused_input_dim - self.tactile_dim
+        elif self.ablation_mode == "no_fsr":
+            return self.state_fused_input_dim - self.fsr_dim
+        return self.state_fused_input_dim
+
+    @property
+    def global_cond_dim(self) -> int:
+        """Total conditioning dim fed into the UNet."""
+        if self.ablation_mode == "full":
+            return self.state_mlp_output_dim + self.pretrained_encoder_embed_dim
+        return self.state_mlp_output_dim
+
+    @property
+    def active_obs_keys(self) -> list[str]:
+        """Observation keys actually used by this ablation variant."""
+        keys = [self.state_feature_key, self.state_velocity_feature_key]
+        if self.ablation_mode in ("full", "no_fsr"):
+            keys.append(self.tactile_feature_key)
+        if self.ablation_mode in ("full", "no_twintac"):
+            keys.append(self.fsr_feature_key)
+        if self.ablation_mode == "full":
+            keys.append(self.sparse_pc_feature_key)
+        return keys
+
+    @property
+    def state_feature_keys(self) -> list[str]:
+        """Expose the required observation keys as a list so that filter_unused_dataset_columns
+        can exclude large unused features (e.g. observation.hand_pc) from parquet loading."""
+        return self.active_obs_keys
 
     def resolve_pretrained_encoder_ckpt_path(self) -> Path:
         path = Path(self.pretrained_encoder_ckpt_path)
@@ -153,20 +210,14 @@ class PretrainDiffusionConfig(PreTrainedConfig):
         )
 
     def validate_features(self) -> None:
-        required_keys = [
-            self.state_feature_key,
-            self.state_velocity_feature_key,
-            self.tactile_feature_key,
-            self.fsr_feature_key,
-            self.sparse_pc_feature_key,
-        ]
         if not self.input_features:
             return
 
-        for key in required_keys:
+        for key in self.active_obs_keys:
             if key not in self.input_features:
                 raise ValueError(
-                    f"Required feature '{key}' not found in input_features. "
+                    f"Required feature '{key}' not found in input_features "
+                    f"(ablation_mode={self.ablation_mode!r}). "
                     f"Available: {list(self.input_features.keys())}"
                 )
 

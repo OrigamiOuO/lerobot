@@ -28,6 +28,7 @@ from torch.optim import Optimizer
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
+from lerobot.datasets.in_memory_dataset import InMemoryLeRobotDataset
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
@@ -221,6 +222,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if not is_main_process:
         dataset = make_dataset(cfg)
 
+    # Optionally preload the full dataset into CPU RAM to eliminate per-step disk I/O.
+    # Controlled by cfg.dataset.preload_to_memory (default: False).
+    if cfg.dataset.preload_to_memory:
+        if is_main_process:
+            logging.info("Preloading dataset into CPU RAM (dataset.preload_to_memory=True)")
+        dataset = InMemoryLeRobotDataset(dataset, num_workers=cfg.num_workers)
+
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
@@ -359,7 +367,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         sampler=sampler,
         pin_memory=device.type == "cuda",
         drop_last=False,
-        prefetch_factor=2 if cfg.num_workers > 0 else None,
+        prefetch_factor=cfg.dataloader_prefetch_factor if cfg.num_workers > 0 else None,
+        persistent_workers=cfg.dataloader_persistent_workers and cfg.num_workers > 0,
     )
 
     # Prepare everything with accelerator

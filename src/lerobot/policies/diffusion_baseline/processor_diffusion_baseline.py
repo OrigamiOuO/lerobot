@@ -38,14 +38,19 @@ from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PR
 class KeepObservationKeysProcessorStep(ObservationProcessorStep):
     """Drop observation entries that are not consumed by the policy."""
 
-    def __init__(self, keep_keys: list[str]):
-        self.keep_keys = set(keep_keys)
+    def __init__(self, keep_keys: list[str] | None = None):
+        # Backward compatibility: older saved processor configs may not include keep_keys.
+        self.keep_keys = set(keep_keys) if keep_keys is not None else None
 
     def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
+        if self.keep_keys is None:
+            return observation
         return {k: v for k, v in observation.items() if k in self.keep_keys}
 
     def transform_features(self, features: dict) -> dict:
         transformed = dict(features)
+        if self.keep_keys is None:
+            return transformed
         if "observation" in transformed:
             transformed_observation = dict(transformed["observation"])
             transformed_observation = {
