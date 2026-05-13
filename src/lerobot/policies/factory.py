@@ -140,6 +140,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.pretrain_diffusion.modeling_pretrain_diffusion import PretrainDiffusionPolicy
 
         return PretrainDiffusionPolicy
+    elif name == "pretrain_act":
+        from lerobot.policies.pretrain_act.modeling_pretrain_act import PretrainACTPolicy
+
+        return PretrainACTPolicy
     else:
         try:
             return _get_policy_cls_from_policy_name(name=name)

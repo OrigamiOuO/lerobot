@@ -30,6 +30,7 @@ from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 # from .tactile_blind_diffusion.configuration_tactile_blind_diffusion import TactileDiffusionConfig as TactileBlindDiffusionConfig
 from .tactile_pointnet_diffusion.configuration_tactile_pointnet_diffusion import TactilePointnetDiffusionConfig as TactilePointnetDiffusionConfig
 from .pretrain_diffusion.configuration_pretrain_diffusion import PretrainDiffusionConfig as PretrainDiffusionConfig
+from .pretrain_act.configuration_pretrain_act import PretrainACTConfig as PretrainACTConfig
 
 __all__ = [
     "ACTConfig",
@@ -52,4 +53,5 @@ __all__ = [
     "TactileACTHaoConfig",
     "TactilePointnetDiffusionConfig",
     "PretrainDiffusionConfig",
+    "PretrainACTConfig",
 ]
