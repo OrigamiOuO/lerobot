@@ -380,7 +380,7 @@ class SOFollower(Robot):
         tracker = self.marker_trackers.get(name)
         
         # Read raw frame from tactile camera
-        frame = tactile_cam.async_read(timeout_ms=200)
+        frame = tactile_cam.async_read(timeout_ms=1000)
         # async_read returns RGB; processor/tracker expect BGR (OpenCV convention)
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         

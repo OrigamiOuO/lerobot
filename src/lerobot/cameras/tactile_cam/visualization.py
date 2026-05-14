@@ -198,8 +198,10 @@ class TactileVisualizer:
     
     DEFAULT_WINDOWS = {
         'original': 'Original Frame',
+        'warped': 'Warped Frame',
         'depth': 'Depth Map',
         'normal': 'Normal Vector',
+        'gradient': 'Gradient',
         'grad_x': 'Gradient X',
         'grad_y': 'Gradient Y',
         'diff': 'Difference',

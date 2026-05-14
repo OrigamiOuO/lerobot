@@ -537,7 +537,10 @@ def reset_tactile_before_episode(robot: Robot, events: dict, timeout_s: float = 
             logging.warning("Timed out waiting for tactile sensors to finish background collection.")
             return
 
-        robot.get_observation()
+        try:
+            robot.get_observation()
+        except Exception as e:
+            logging.warning(f"Error reading observation during tactile reset (will retry): {e}")
 
 
 @parser.wrap()

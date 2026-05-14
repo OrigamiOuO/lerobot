@@ -532,7 +532,7 @@ def main():
     processor = MLPProcessorV2(ppmm=PPMM, blur_ksize=BLUR_KSIZE)
     print(f"[INFO] 高斯模糊: ksize={BLUR_KSIZE}" if BLUR_KSIZE > 0 else "[INFO] 高斯模糊: 关闭")
     visualizer = TactileVisualizer(
-        windows=['original', 'depth', 'normal', 'gradient', 'marker'],
+        windows=['original', 'warped', 'depth', 'normal', 'gradient', 'marker'],
         window_size=(640, 480)
     )
     
@@ -572,7 +572,10 @@ def main():
                 depth_colored, normal_colored, grad_colored, raw_depth, G, C = \
                     processor.process_frame(warped_frame, apply_warp=False)
                 
-                visualizer.show('original', warped_frame)
+                # 显示透视变换前的原始图像
+                visualizer.show('original', frame_bgr)
+                # 显示透视变换后的图像
+                visualizer.show('warped', warped_frame)
                 visualizer.show('depth', depth_colored)
                 visualizer.show('normal', normal_colored)
                 visualizer.show('gradient', grad_colored)
