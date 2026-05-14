@@ -43,15 +43,20 @@ class DiffusionHaoConfig(PreTrainedConfig):
         tactile_vision_backbone: ResNet variant for 4-channel tactile data.
         tactile_backbone_in_channels: Input channels for tactile backbone (depth=1 + normal=3 = 4).
         tactile_marker_embed_dim: Output dimension for tactile marker encoder.
+        tactile_modalities: Tactile modalities to use (raw, fused, marker). None uses all available.
     """
 
     # Whether to use tactile sensor data. Set to False for ablation without tactile.
     use_tactile: bool = True
 
+    # Select tactile modalities to use: raw (tac_raw), fused (tac_depth + tac_normal), marker.
+    # None means use all tactile modalities available in the dataset.
+    tactile_modalities: list[str] | None = None
+
     # Inputs / output structure.
-    n_obs_steps: int = 2
-    horizon: int = 8
-    n_action_steps: int = 4
+    n_obs_steps: int = 4
+    horizon: int = 24
+    n_action_steps: int = 8
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -185,6 +190,15 @@ class DiffusionHaoConfig(PreTrainedConfig):
 
     def validate_features(self) -> None:
         """Validate that all required features are present."""
+        supported_modalities = {"raw", "fused", "marker"}
+        if self.tactile_modalities is not None:
+            unknown = set(self.tactile_modalities) - supported_modalities
+            if unknown:
+                raise ValueError(
+                    "`tactile_modalities` must be a subset of "
+                    f"{sorted(supported_modalities)}. Got {sorted(unknown)}."
+                )
+
         # When use_tactile=False, remove all tactile-related input features for ablation.
         if not self.use_tactile and self.input_features:
             tactile_prefixes = (
@@ -200,6 +214,29 @@ class DiffusionHaoConfig(PreTrainedConfig):
                 k: v for k, v in self.input_features.items()
                 if not any(k.startswith(p) for p in tactile_prefixes)
             }
+        elif self.input_features and self.tactile_modalities is not None:
+            enabled = set(self.tactile_modalities)
+            disable_prefixes: tuple[str, ...] = ()
+            if "raw" not in enabled:
+                disable_prefixes += (
+                    "observation.images.tac_raw.",
+                    "observation.tac_raw.",
+                )
+            if "fused" not in enabled:
+                disable_prefixes += (
+                    "observation.images.tac_depth.",
+                    "observation.tac_depth.",
+                    "observation.images.tac_normal.",
+                    "observation.tac_normal.",
+                )
+            if "marker" not in enabled:
+                disable_prefixes += ("observation.tac_marker_displacement.",)
+
+            if disable_prefixes:
+                self.input_features = {
+                    k: v for k, v in self.input_features.items()
+                    if not any(k.startswith(p) for p in disable_prefixes)
+                }
 
         if self.crop_shape is not None:
             for key, image_ft in self.image_features.items():

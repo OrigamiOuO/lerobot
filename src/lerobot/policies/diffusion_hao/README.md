@@ -89,6 +89,10 @@ class DiffusionHaoConfig(PreTrainedConfig):
     # 触觉标记点编码器配置
     tactile_marker_input_dim: int = 70  # 35 markers × 2 coordinates
     tactile_marker_embed_dim: int = 64  # 输出维度（与 state_dim 相近）
+
+    # 触觉模态选择：raw(触觉原始图), fused(深度+法线), marker(标记点位移)
+    # 设为 None 表示使用数据集中所有可用的触觉模态
+    tactile_modalities: list[str] | None = None
 ```
 
 ## 使用方法
@@ -100,6 +104,13 @@ python lerobot/scripts/train.py \
     --policy.type=diffusion_hao \
     --dataset.repo_id=your_tactile_dataset \
     --output_dir=checkpoints/diffusion_hao
+
+# 仅使用触觉原始图 + 标记点位移
+python lerobot/scripts/train.py \
+    --policy.type=diffusion_hao \
+    --policy.tactile_modalities='[raw,marker]' \
+    --dataset.repo_id=your_tactile_dataset \
+    --output_dir=checkpoints/diffusion_hao_raw_marker
 ```
 
 ### 配置文件示例
