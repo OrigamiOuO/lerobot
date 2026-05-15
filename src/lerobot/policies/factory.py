@@ -32,8 +32,10 @@ from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.diffusion_dino.configuration_diffusion_dino import DiffusionDinoConfig
-from lerobot.policies.diffusion_hao.configuration_diffusion_hao import DiffusionHaoConfig
-from lerobot.policies.groot.configuration_groot import GrootConfig
+from lerobot.policies.diffusion_attention.configuration_diffusion_attention import DiffusionAttentionConfig
+from lerobot.policies.diffusion_baseline.configuration_diffusion_baseline import DiffusionBaselineConfig
+from lerobot.policies.diffusion_sparsh.configuration_diffusion_sparsh import DiffusionSparshConfig
+from lerobot.policies.diffusion_sparsh.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 
@@ -123,7 +125,7 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
 
         return SARMRewardModel
     elif name == "groot":
-        from lerobot.policies.groot.modeling_groot import GrootPolicy
+        from lerobot.policies.diffusion_sparsh.groot.modeling_groot import GrootPolicy
 
         return GrootPolicy
     elif name == "xvla":
@@ -135,14 +137,26 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
 
         return WallXPolicy
 
-    elif name == "diffusion_hao":
-        from lerobot.policies.diffusion_hao.modeling_diffusion_hao import DiffusionHaoPolicy
+    elif name == "diffusion_baseline":
+        from lerobot.policies.diffusion_baseline.modeling_diffusion_baseline import (
+            DiffusionBaselinePolicy,
+        )
 
-        return DiffusionHaoPolicy
+        return DiffusionBaselinePolicy
+    elif name == "diffusion_attention":
+        from lerobot.policies.diffusion_attention.modeling_diffusion_attention import (
+            DiffusionAttentionPolicy,
+        )
+
+        return DiffusionAttentionPolicy
     elif name == "diffusion_dino":
         from lerobot.policies.diffusion_dino.modeling_diffusion_dino import DiffusionDinoPolicy
 
         return DiffusionDinoPolicy
+    elif name == "diffusion_sparsh":
+        from lerobot.policies.diffusion_sparsh.modeling_diffusion_sparsh import DiffusionSparshPolicy
+
+        return DiffusionSparshPolicy
     else:
         try:
             return _get_policy_cls_from_policy_name(name=name)
@@ -193,10 +207,14 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return XVLAConfig(**kwargs)
     elif policy_type == "wall_x":
         return WallXConfig(**kwargs)
-    elif policy_type == "diffusion_hao":
-        return DiffusionHaoConfig(**kwargs)
+    elif policy_type == "diffusion_baseline":
+        return DiffusionBaselineConfig(**kwargs)
+    elif policy_type == "diffusion_attention":
+        return DiffusionAttentionConfig(**kwargs)
     elif policy_type == "diffusion_dino":
         return DiffusionDinoConfig(**kwargs)
+    elif policy_type == "diffusion_sparsh":
+        return DiffusionSparshConfig(**kwargs)
     else:
         try:
             config_cls = PreTrainedConfig.get_choice_class(policy_type)
@@ -317,10 +335,22 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
         )
 
-    elif isinstance(policy_cfg, DiffusionHaoConfig):
-        from lerobot.policies.diffusion_hao.processor_diffusion_hao import make_diffusion_hao_pre_post_processors
+    elif policy_cfg.type == "diffusion_attention":
+        from lerobot.policies.diffusion_attention.processor_diffusion_attention import (
+            make_diffusion_attention_pre_post_processors,
+        )
 
-        processors = make_diffusion_hao_pre_post_processors(
+        processors = make_diffusion_attention_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif policy_cfg.type == "diffusion_baseline":
+        from lerobot.policies.diffusion_baseline.processor_diffusion_baseline import (
+            make_diffusion_baseline_pre_post_processors,
+        )
+
+        processors = make_diffusion_baseline_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
@@ -398,7 +428,7 @@ def make_pre_post_processors(
             dataset_meta=kwargs.get("dataset_meta"),
         )
     elif isinstance(policy_cfg, GrootConfig):
-        from lerobot.policies.groot.processor_groot import make_groot_pre_post_processors
+        from lerobot.policies.diffusion_sparsh.groot.processor_groot import make_groot_pre_post_processors
 
         processors = make_groot_pre_post_processors(
             config=policy_cfg,

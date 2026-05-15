@@ -41,11 +41,11 @@ try:
 except ImportError:
     tree = None
 
-from lerobot.policies.groot.action_head.flow_matching_action_head import (
+from lerobot.policies.diffusion_sparsh.groot.action_head.flow_matching_action_head import (
     FlowmatchingActionHead,
     FlowmatchingActionHeadConfig,
 )
-from lerobot.policies.groot.utils import ensure_eagle_cache_ready
+from lerobot.policies.diffusion_sparsh.groot.utils import ensure_eagle_cache_ready
 from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME
 
 DEFAULT_VENDOR_EAGLE_PATH = str((Path(__file__).resolve().parent / "eagle2_hg_model").resolve())

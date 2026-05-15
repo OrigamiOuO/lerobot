@@ -14,7 +14,7 @@
 
 from .act.configuration_act import ACTConfig as ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
-from .groot.configuration_groot import GrootConfig as GrootConfig
+from .diffusion_sparsh.groot.configuration_groot import GrootConfig as GrootConfig
 from .pi0.configuration_pi0 import PI0Config as PI0Config
 from .pi0_fast.configuration_pi0_fast import PI0FastConfig as PI0FastConfig
 from .pi05.configuration_pi05 import PI05Config as PI05Config
@@ -26,6 +26,8 @@ from .wall_x.configuration_wall_x import WallXConfig as WallXConfig
 from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 from .diffusion_hao.configuration_diffusion_hao import DiffusionHaoConfig as DiffusionHaoConfig
 from .diffusion_henry.configuration_diffusion_henry import DiffusionHenryConfig as DiffusionHenryConfig
+from .diffusion_baseline.configuration_diffusion_baseline import DiffusionBaselineConfig as DiffusionBaselineConfig
+from .diffusion_attention.configuration_diffusion_attention import DiffusionAttentionConfig as DiffusionAttentionConfig
 
 __all__ = [
     "ACTConfig",
@@ -42,4 +44,6 @@ __all__ = [
     "WallXConfig",
     "DiffusionHaoConfig",
     "DiffusionHenryConfig",
+    "DiffusionBaselineConfig",
+    "DiffusionAttentionConfig",
 ]

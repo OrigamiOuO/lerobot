@@ -1,8 +1,8 @@
-# Diffusion-Henry: Tactile-Augmented Diffusion Policy
+# Diffusion-Baseline: Tactile-Augmented Diffusion Policy
 
 ## 概述
 
-`diffusion_henry` 是基于原始 Diffusion Policy 的触觉增强版本，专门设计用于处理包含触觉传感器数据的机器人学习任务。
+`diffusion_baseline` 是基于原始 Diffusion Policy 的触觉增强版本，专门设计用于处理包含触觉传感器数据的机器人学习任务。
 
 ## 触觉数据支持
 
@@ -64,18 +64,18 @@ tac_marker_displacement (35, 2)
 ## 代码结构
 
 ```
-diffusion_henry/
+diffusion_baseline/
 ├── __init__.py
 ├── README.md
-├── configuration_diffusion_henry.py    # 配置类
-└── modeling_diffusion_henry.py         # 模型实现
+├── configuration_diffusion_baseline.py    # 配置类
+└── modeling_diffusion_baseline.py         # 模型实现
 ```
 
 ## 配置参数
 
 ```python
 @dataclass
-class DiffusionHenryConfig(PreTrainedConfig):
+class DiffusionBaselineConfig(PreTrainedConfig):
     # 继承自 DiffusionConfig 的参数...
     
     # === 触觉相关新增参数 ===
@@ -97,16 +97,16 @@ class DiffusionHenryConfig(PreTrainedConfig):
 
 ```bash
 python lerobot/scripts/train.py \
-    --policy.type=diffusion_henry \
+    --policy.type=diffusion_baseline \
     --dataset.repo_id=your_tactile_dataset \
-    --output_dir=checkpoints/diffusion_henry
+    --output_dir=checkpoints/diffusion_baseline
 ```
 
 ### 配置文件示例
 
 ```yaml
 policy:
-  type: diffusion_henry
+    type: diffusion_baseline
   n_obs_steps: 2
   horizon: 16
   n_action_steps: 8

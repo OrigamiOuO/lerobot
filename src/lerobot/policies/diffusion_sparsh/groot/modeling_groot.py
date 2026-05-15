@@ -38,8 +38,8 @@ from collections import deque
 import torch
 from torch import Tensor
 
-from lerobot.policies.groot.configuration_groot import GrootConfig
-from lerobot.policies.groot.groot_n1 import GR00TN15
+from lerobot.policies.diffusion_sparsh.groot.configuration_groot import GrootConfig
+from lerobot.policies.diffusion_sparsh.groot.groot_n1 import GR00TN15
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION
 

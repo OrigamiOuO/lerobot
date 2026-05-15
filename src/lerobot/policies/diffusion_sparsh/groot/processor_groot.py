@@ -35,7 +35,7 @@ from lerobot.configs.types import (
     NormalizationMode,
     PolicyFeature,
 )
-from lerobot.policies.groot.configuration_groot import GrootConfig
+from lerobot.policies.diffusion_sparsh.groot.configuration_groot import GrootConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,

@@ -2,7 +2,7 @@
 
 # Copyright 2024 Columbia Artificial Intelligence, Robotics Lab,
 # and The HuggingFace Inc. team. All rights reserved.
-# Modified for Diffusion-Henry tactile adaptation.
+# Modified for Diffusion-Baseline tactile adaptation.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,12 +15,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Diffusion-Henry Policy: Diffusion Policy with tactile sensor support.
+"""Diffusion-Baseline Policy: Diffusion Policy with tactile sensor support.
 
-Extends the original Diffusion Policy to handle:
-- Standard images (global, inhand, tac_raw) via shared ResNet backbone
-- Tactile depth + normal (4-channel) via independent ResNet backbone
-- Tactile marker displacement fused with robot state via project-then-fuse strategy
+Main design:
+- Standard RGB images are encoded by the RGB image branch.
+- Tactile raw images are encoded by an independent tactile raw branch.
+- Tactile depth and normal streams are explicitly paired by sensor suffix, then
+  fused into a 4-channel normal+depth tensor and encoded by a tactile fused branch.
+- Marker displacement is flattened and encoded by a lightweight MLP.
+- All encoded features build a global condition for a UNet or DiT action denoiser.
+- Optional denoiser-level MoE routes between semantic expert denoisers such as
+  visual, tactile, and other experts.
 """
 
 import math
@@ -36,7 +41,9 @@ from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from torch import Tensor, nn
 
-from lerobot.policies.diffusion_henry.configuration_diffusion_henry import DiffusionHenryConfig
+from lerobot.policies.diffusion_baseline.configuration_diffusion_baseline import (
+    DiffusionBaselineConfig,
+)
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import (
     get_device_from_parameters,
@@ -46,24 +53,180 @@ from lerobot.policies.utils import (
 )
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 
+# =============================================================================
+# Constants and feature-key helpers
+# =============================================================================
+
 # Custom keys for tactile data
-OBS_TAC_FUSED = "observation.tac_fused"  # Synthetic 4-channel key (depth + normal)
+OBS_TAC_FUSED = "observation.tac_fused"  # Synthetic 4-channel key (normal + depth)
 OBS_TAC_RAW = "observation.tac_raw"  # Raw tactile image data
 OBS_TAC_MARKER = "observation.tac_marker"  # Flattened marker displacement
 
+TACTILE_RAW_PREFIXES = (
+    "observation.images.tac_raw.",
+    "observation.tac_raw.",
+)
+TACTILE_DEPTH_PREFIXES = (
+    "observation.images.tac_depth.",
+    "observation.tac_depth.",
+)
+TACTILE_NORMAL_PREFIXES = (
+    "observation.images.tac_normal.",
+    "observation.tac_normal.",
+)
+TACTILE_MARKER_PREFIXES = (
+    "observation.tac_marker_displacement.",
+)
+TACTILE_PREFIXES = (
+    *TACTILE_RAW_PREFIXES,
+    *TACTILE_DEPTH_PREFIXES,
+    *TACTILE_NORMAL_PREFIXES,
+    *TACTILE_MARKER_PREFIXES,
+)
 
-class DiffusionHenryPolicy(PreTrainedPolicy):
-    """Diffusion-Henry Policy with tactile sensor support.
 
-    Extends Diffusion Policy to handle tactile depth+normal images and marker displacement data.
+def _is_tactile_feature_key(key: str) -> bool:
+    """Return whether a dataset key belongs to a tactile stream."""
+    return any(key.startswith(prefix) for prefix in TACTILE_PREFIXES)
+
+
+def _strip_prefix(key: str, prefixes: tuple[str, ...]) -> str:
+    """Remove the first matching prefix and return a stable sensor suffix."""
+    for prefix in prefixes:
+        if key.startswith(prefix):
+            return key[len(prefix) :]
+    return key.split(".")[-1]
+
+
+def _sort_keys_by_suffix(keys: list[str], prefixes: tuple[str, ...]) -> list[str]:
+    """Sort feature keys by sensor suffix for deterministic multi-sensor packing."""
+    return sorted(keys, key=lambda key: _strip_prefix(key, prefixes))
+
+
+def _map_keys_by_suffix(keys: list[str], prefixes: tuple[str, ...], stream_name: str) -> dict[str, str]:
+    """Map sensor suffix -> key and fail early on duplicate suffixes."""
+    key_map: dict[str, str] = {}
+    for key in keys:
+        suffix = _strip_prefix(key, prefixes)
+        if suffix in key_map:
+            raise ValueError(
+                f"Duplicate {stream_name} tactile suffix `{suffix}` for keys "
+                f"`{key_map[suffix]}` and `{key}`. Please use unique sensor suffixes."
+            )
+        key_map[suffix] = key
+    return key_map
+
+
+def _pair_tactile_depth_normal_keys(depth_keys: list[str], normal_keys: list[str]) -> list[tuple[str, str]]:
+    """Pair tactile depth and normal keys by sensor suffix rather than dict order.
+
+    This avoids silent bugs such as pairing depth.tac1 with normal.tac2 when
+    multiple tactile sensors are registered in a different order.
+    """
+    depth_by_suffix = _map_keys_by_suffix(depth_keys, TACTILE_DEPTH_PREFIXES, "depth")
+    normal_by_suffix = _map_keys_by_suffix(normal_keys, TACTILE_NORMAL_PREFIXES, "normal")
+
+    depth_suffixes = set(depth_by_suffix)
+    normal_suffixes = set(normal_by_suffix)
+    if depth_suffixes != normal_suffixes:
+        missing_normal = sorted(depth_suffixes - normal_suffixes)
+        missing_depth = sorted(normal_suffixes - depth_suffixes)
+        raise ValueError(
+            "Tactile depth/normal keys must be paired by sensor suffix. "
+            f"Missing normal for {missing_normal}; missing depth for {missing_depth}."
+        )
+
+    return [(depth_by_suffix[suffix], normal_by_suffix[suffix]) for suffix in sorted(depth_suffixes)]
+
+
+def _infer_image_channels_hw(shape: tuple[int, ...] | torch.Size) -> tuple[int, int, int]:
+    """Infer (channels, height, width) from a PolicyFeature image shape.
+
+    LeRobot image features are usually channel-first, but some tactile features
+    can be channel-last when produced by custom preprocessing.
+    """
+    shape = tuple(shape)
+    if len(shape) != 3:
+        raise ValueError(f"Expected an image feature shape with 3 dimensions. Got {shape}.")
+
+    if shape[0] in (1, 3, 4):
+        return shape[0], shape[1], shape[2]
+    if shape[-1] in (1, 3, 4):
+        return shape[-1], shape[0], shape[1]
+
+    # Fallback to channel-first, matching torchvision conventions.
+    return shape[0], shape[1], shape[2]
+
+
+def _image_to_channel_last(x: Tensor, expected_channels: tuple[int, ...], name: str) -> Tensor:
+    """Convert (..., C, H, W) or (..., H, W, C) image tensors to channel-last."""
+    if x.dim() < 3:
+        raise ValueError(f"`{name}` must have at least 3 dimensions. Got shape {tuple(x.shape)}.")
+
+    if x.shape[-1] in expected_channels:
+        return x
+    if x.shape[-3] in expected_channels:
+        return x.movedim(-3, -1)
+
+    raise ValueError(
+        f"Cannot infer channel dimension for `{name}` with shape {tuple(x.shape)}. "
+        f"Expected channel count in {expected_channels}."
+    )
+
+
+def _depth_to_channel_last_one_channel(depth: Tensor, key: str) -> Tensor:
+    """Convert depth tensor to channel-last with one channel.
+
+    Some video backends decode a single-channel depth image as 3 channels; in
+    that case the channels are averaged back to one channel.
+    """
+    depth = _image_to_channel_last(depth, expected_channels=(1, 3), name=key)
+    if depth.shape[-1] == 3:
+        depth = depth.mean(dim=-1, keepdim=True)
+    if depth.shape[-1] != 1:
+        raise ValueError(f"Depth key `{key}` should be 1-channel after conversion. Got {tuple(depth.shape)}.")
+    return depth
+
+
+def _normal_to_channel_last_three_channels(normal: Tensor, key: str) -> Tensor:
+    """Convert normal tensor to channel-last with three channels."""
+    normal = _image_to_channel_last(normal, expected_channels=(3,), name=key)
+    if normal.shape[-1] != 3:
+        raise ValueError(f"Normal key `{key}` should be 3-channel after conversion. Got {tuple(normal.shape)}.")
+    return normal
+
+
+def _normal_depth_to_channel_first_4ch(normal: Tensor, depth: Tensor) -> Tensor:
+    """Concatenate channel-last normal and depth tensors, then return channel-first."""
+    tactile_4ch = torch.cat([normal, depth], dim=-1)  # (..., H, W, 4)
+    return tactile_4ch.movedim(-1, -3)  # (..., 4, H, W)
+
+
+def _make_mlp_projection(in_dim: int, out_dim: int) -> nn.Module:
+    """Small projection used when a config adds `modality_projection_dim`."""
+    if in_dim == out_dim:
+        return nn.Identity()
+    return nn.Sequential(nn.LayerNorm(in_dim), nn.Linear(in_dim, out_dim), nn.GELU(), nn.LayerNorm(out_dim))
+
+
+# =============================================================================
+# Policy wrapper and batch packing
+# =============================================================================
+
+
+class DiffusionBaselinePolicy(PreTrainedPolicy):
+    """Diffusion-Baseline Policy with tactile sensor support.
+
+    The policy wrapper is responsible for rollout queues and for converting raw
+    dataset keys into the compact internal keys consumed by `DiffusionBaselineModel`.
     """
 
-    config_class = DiffusionHenryConfig
-    name = "diffusion_henry"
+    config_class = DiffusionBaselineConfig
+    name = "diffusion_baseline"
 
     def __init__(
         self,
-        config: DiffusionHenryConfig,
+        config: DiffusionBaselineConfig,
         **kwargs,
     ):
         """
@@ -71,26 +234,68 @@ class DiffusionHenryPolicy(PreTrainedPolicy):
             config: Policy configuration class instance.
         """
         super().__init__(config)
-        config.validate_features()
+        self._validate_features_for_diffusion_baseline(config)
         self.config = config
 
         # queues are populated during rollout of the policy
         self._queues = None
 
-        self.diffusion = DiffusionHenryModel(config)
+        self.diffusion = DiffusionBaselineModel(config)
 
         self.reset()
+
+    @staticmethod
+    def _validate_features_for_diffusion_baseline(config: DiffusionBaselineConfig) -> None:
+        """Validate input features without mixing tactile image keys with RGB keys.
+
+        `DiffusionBaselineConfig.validate_features()` assumes all image features have
+        the same shape. That is too strict for this policy because tactile depth,
+        tactile normal, tactile raw and RGB can all be stored as image-like
+        features while being processed by different branches.
+        """
+        depth_keys = list(config.tactile_depth_features.keys())
+        normal_keys = list(config.tactile_normal_features.keys())
+        if len(depth_keys) != len(normal_keys):
+            raise ValueError(
+                "Tactile depth/normal feature count mismatch: "
+                f"got {len(depth_keys)} depth streams vs {len(normal_keys)} normal streams. "
+                "Please provide paired depth+normal keys per tactile sensor."
+            )
+        if len(depth_keys) > 0:
+            _pair_tactile_depth_normal_keys(depth_keys, normal_keys)
+
+        rgb_image_features = config.enabled_rgb_image_features
+
+        if config.crop_shape is not None:
+            for key, image_ft in rgb_image_features.items():
+                _, height, width = _infer_image_channels_hw(image_ft.shape)
+                if config.crop_shape[0] > height or config.crop_shape[1] > width:
+                    raise ValueError(
+                        f"`crop_shape` should fit within RGB image shapes. Got {config.crop_shape} "
+                        f"for `{key}` with shape {image_ft.shape}."
+                    )
+
+        if len(rgb_image_features) > 0:
+            first_key, first_ft = next(iter(rgb_image_features.items()))
+            first_shape = first_ft.shape
+            for key, image_ft in rgb_image_features.items():
+                if image_ft.shape != first_shape:
+                    raise ValueError(
+                        f"`{key}` does not match `{first_key}`, but standard RGB image "
+                        "features are expected to have the same shape. Tactile image-like "
+                        "features are excluded from this check."
+                    )
 
     def get_optim_params(self) -> dict:
         return self.diffusion.parameters()
 
     def reset(self):
-        """Clear observation and action queues. Should be called on `env.reset()`"""
+        """Clear observation and action queues. Should be called on `env.reset()`."""
         self._queues = {
             OBS_STATE: deque(maxlen=self.config.n_obs_steps),
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
-        if self.config.image_features:
+        if self.config.enabled_rgb_image_features:
             self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
         if self.config.env_state_feature:
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
@@ -104,21 +309,18 @@ class DiffusionHenryPolicy(PreTrainedPolicy):
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """Predict a chunk of actions given environment observations."""
-        batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+        batch = {key: torch.stack(list(self._queues[key]), dim=1) for key in batch if key in self._queues}
         actions = self.diffusion.generate_actions(batch, noise=noise)
         return actions
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """Select a single action given environment observations."""
-        # NOTE: for offline evaluation, we have action in the batch, so we need to pop it out
+        # NOTE: for offline evaluation, we have action in the batch, so we need to pop it out.
         if ACTION in batch:
             batch.pop(ACTION)
 
-        # Prepare the batch (stack images, synthesize tactile data)
         batch = self._prepare_batch(batch)
-
-        # NOTE: It's important that this happens after preparing the batch.
         self._queues = populate_queues(self._queues, batch)
 
         if len(self._queues[ACTION]) == 0:
@@ -135,86 +337,62 @@ class DiffusionHenryPolicy(PreTrainedPolicy):
         return loss, None
 
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
-        """Prepare the batch: collect images, synthesize tactile 4-channel, flatten marker."""
+        """Pack raw dataset keys into internal observation keys.
+
+        The main correctness change is tactile depth/normal pairing: we pair by
+        sensor suffix, not by Python dict order.
+        """
         batch = dict(batch)  # shallow copy
 
-        depth_keys = list(self.config.tactile_depth_features.keys())
-        normal_keys = list(self.config.tactile_normal_features.keys())
-        tac_raw_keys = list(self.config.tactile_raw_features.keys())
+        depth_keys = _sort_keys_by_suffix(list(self.config.tactile_depth_features.keys()), TACTILE_DEPTH_PREFIXES)
+        normal_keys = _sort_keys_by_suffix(list(self.config.tactile_normal_features.keys()), TACTILE_NORMAL_PREFIXES)
+        tac_raw_keys = _sort_keys_by_suffix(list(self.config.tactile_raw_features.keys()), TACTILE_RAW_PREFIXES)
+        depth_normal_pairs = _pair_tactile_depth_normal_keys(depth_keys, normal_keys) if depth_keys else []
 
-        # 1. Collect standard image features while excluding tactile raw/depth/normal features.
-        # This keeps tac_raw/tac_depth/tac_normal 
-        if self.config.image_features:
-            tactile_keys = set(depth_keys + normal_keys + tac_raw_keys)
-            rgb_image_keys = [key for key in self.config.image_features if key not in tactile_keys]
-            if len(rgb_image_keys) > 0:
-                batch[OBS_IMAGES] = torch.stack([batch[key] for key in rgb_image_keys], dim=-4)
-        
-        # 2. Collect tactile raw features (if present) without mixing them with RGB image features.
-        if self.config.has_tactile_raw:
-            if len(tac_raw_keys) > 0:
-                # Support single or multiple tactile raw cameras
-                tac_raw_images = torch.stack([batch[key] for key in tac_raw_keys], dim=-4)
-                batch[OBS_TAC_RAW] = tac_raw_images  # (B, n_obs_steps, n_raw, C, H, W)
+        # 1. Standard RGB image features only. Tactile image-like keys are routed
+        #    to their own branches below.
+        rgb_image_keys = list(self.config.enabled_rgb_image_features.keys())
+        if len(rgb_image_keys) > 0:
+            batch[OBS_IMAGES] = torch.stack([batch[key] for key in rgb_image_keys], dim=-4)
 
-        # 3. Synthesize tac_depth + tac_normal → 4-channel tactile images (supports multiple sensor pairs)
-        if self.config.has_tactile_fused:
-            if len(depth_keys) > 0 and len(normal_keys) > 0:
-                # Support single or multiple depth+normal pairs
-                fused_list = []
-                for depth_key, normal_key in zip(depth_keys, normal_keys, strict=True):
-                    depth = batch[depth_key]
-                    normal = batch[normal_key]  # (B, H, W, 3) or (B, n_obs_steps, H, W, 3)
+        # 2. Tactile raw images.
+        if self.config.has_tactile_raw and len(tac_raw_keys) > 0:
+            if len(tac_raw_keys) == 1:
+                batch[OBS_TAC_RAW] = batch[tac_raw_keys[0]]  # (B, S, C, H, W)
+            else:
+                batch[OBS_TAC_RAW] = torch.stack([batch[key] for key in tac_raw_keys], dim=-4)
 
-                    # Video-encoded depth may decode as 3 channels. Reduce it to 1 channel via channel mean.
-                    # Supports both channel-first (..., C, H, W) and channel-last (..., H, W, C).
-                    if depth.dim() >= 3:
-                        if depth.shape[-3] in (1, 3):
-                            depth = depth.mean(dim=-3, keepdim=True)
-                        elif depth.shape[-1] in (1, 3):
-                            depth = depth.mean(dim=-1, keepdim=True)
+        # 3. Tactile fused normal+depth images. The channel order is [normal, depth].
+        if self.config.has_tactile_fused and len(depth_normal_pairs) > 0:
+            fused_list = []
+            for depth_key, normal_key in depth_normal_pairs:
+                depth = _depth_to_channel_last_one_channel(batch[depth_key], depth_key)
+                normal = _normal_to_channel_last_three_channels(batch[normal_key], normal_key)
+                fused_list.append(_normal_depth_to_channel_first_4ch(normal, depth))
 
-                    # Ensure normal is channel-last for concatenation below.
-                    if normal.dim() >= 3 and normal.shape[-3] in (1, 3):
-                        normal_for_concat = normal.movedim(-3, -1)
-                    else:
-                        normal_for_concat = normal
+            if len(fused_list) == 1:
+                batch[OBS_TAC_FUSED] = fused_list[0]  # (B, S, 4, H, W) or (B, 4, H, W)
+            else:
+                batch[OBS_TAC_FUSED] = torch.stack(fused_list, dim=-4)  # (B, S, N, 4, H, W)
 
-                    # Ensure depth is channel-last for concatenation below.
-                    if depth.dim() >= 3 and depth.shape[-3] == 1:
-                        depth_for_concat = depth.movedim(-3, -1)
-                    else:
-                        depth_for_concat = depth
-
-                    # Concatenate depth and normal to 4-channel
-                    tac_4ch = torch.cat([normal_for_concat, depth_for_concat], dim=-1)  # (..., H, W, 4)
-
-                    # Permute to channel-first format
-                    # Handle both (B, H, W, 4) and (B, n_obs_steps, H, W, 4)
-                    if tac_4ch.dim() == 4:
-                        tac_4ch = tac_4ch.permute(0, 3, 1, 2)  # (B, 4, H, W)
-                    else:
-                        tac_4ch = tac_4ch.permute(0, 1, 4, 2, 3)  # (B, n_obs_steps, 4, H, W)
-
-                    fused_list.append(tac_4ch)
-
-                # Stack multiple fused pairs if present
-                if len(fused_list) > 1:
-                    batch[OBS_TAC_FUSED] = torch.stack(fused_list, dim=-4)  # (B, n_obs_steps, n_fused, 4, H, W)
-                else:
-                    batch[OBS_TAC_FUSED] = fused_list[0]  # (B, n_obs_steps, 4, H, W)
-
-        # 4. Flatten tac_marker_displacement: (B, 35, 2) → (B, 70)
+        # 4. Marker displacement: (B, S, 35, 2) -> (B, S, 70), or (B, 35, 2) -> (B, 70).
         if self.config.has_tactile_marker:
             marker_keys = list(self.config.tactile_marker_features.keys())
             if len(marker_keys) > 0:
-                marker_key = marker_keys[0]
-                marker = batch[marker_key]  # (B, 35, 2) or (B, n_obs_steps, 35, 2)
-                # Flatten the marker coordinates
-                batch[OBS_TAC_MARKER] = marker.flatten(start_dim=-2)  # (B, 70) or (B, n_obs_steps, 70)
+                if len(marker_keys) > 1:
+                    raise ValueError(
+                        "Multiple tactile marker streams are not yet fused explicitly. "
+                        f"Got marker keys: {marker_keys}."
+                    )
+                marker = batch[marker_keys[0]]
+                batch[OBS_TAC_MARKER] = marker.flatten(start_dim=-2)
 
         return batch
 
+
+# =============================================================================
+# Scheduler and feature-level MoE
+# =============================================================================
 
 def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
     """Factory for noise scheduler instances."""
@@ -377,10 +555,16 @@ class MultiModalConsensusMoE(nn.Module):
         return self.out_norm(consensus)
 
 
-class DiffusionHenryModel(nn.Module):
-    """Core Diffusion model with tactile sensor support."""
+class DiffusionBaselineModel(nn.Module):
+    """Core diffusion model with tactile sensor support.
 
-    def __init__(self, config: DiffusionHenryConfig):
+    This class builds three conceptual parts:
+    1. observation encoders;
+    2. optional modality-level consensus MoE;
+    3. either a single denoiser or a semantic denoiser-level MoE.
+    """
+
+    def __init__(self, config: DiffusionBaselineConfig):
         super().__init__()
         self.config = config
         self.use_denoiser_moe = config.use_denoiser_moe
@@ -392,67 +576,92 @@ class DiffusionHenryModel(nn.Module):
         self.denoiser_moe_debug_every_n_calls = config.denoiser_moe_debug_every_n_calls
         self.denoiser_moe_debug_print_full_weights = config.denoiser_moe_debug_print_full_weights
         self._denoiser_inference_call_count = 0
-        self.last_denoiser_moe_routing: dict[str, list[float] | list[str] | int | str] | None = None
+        self.last_denoiser_moe_routing: dict[str, float | list[float] | list[str] | int | str] | None = None
 
-        # Keep tactile raw/depth/normal out of the RGB branch when they are video/image features.
-        self._tactile_depth_keys = list(self.config.tactile_depth_features.keys())
-        self._tactile_normal_keys = list(self.config.tactile_normal_features.keys())
-        self._tactile_raw_keys = list(self.config.tactile_raw_features.keys())
+        # Optional modality projection. Existing configs do not need this field;
+        # if you add `modality_projection_dim=128` to the config, every modality
+        # except the robot state can be normalized/projected before concatenation.
+        self.modality_projection_dim: int | None = getattr(config, "modality_projection_dim", None)
+        self.project_state: bool = bool(getattr(config, "project_state_condition", False))
+        self.modality_projectors = nn.ModuleDict()
 
-        tactile_keys = set(self._tactile_depth_keys + self._tactile_normal_keys + self._tactile_raw_keys)
+        # Keep tactile raw/depth/normal out of the RGB branch when they are stored
+        # as video/image features.
+        self._tactile_depth_keys = _sort_keys_by_suffix(
+            list(self.config.tactile_depth_features.keys()), TACTILE_DEPTH_PREFIXES
+        )
+        self._tactile_normal_keys = _sort_keys_by_suffix(
+            list(self.config.tactile_normal_features.keys()), TACTILE_NORMAL_PREFIXES
+        )
+        self._tactile_raw_keys = _sort_keys_by_suffix(
+            list(self.config.tactile_raw_features.keys()), TACTILE_RAW_PREFIXES
+        )
+        self._tactile_fused_pairs = _pair_tactile_depth_normal_keys(
+            self._tactile_depth_keys, self._tactile_normal_keys
+        ) if len(self._tactile_depth_keys) > 0 else []
 
-        self._rgb_image_keys = [key for key in self.config.image_features if key not in tactile_keys]
+        self._rgb_image_keys = list(self.config.enabled_rgb_image_features.keys())
 
-        # Build observation encoders
-        # Start with robot state dimension
-        global_cond_dim = self.config.robot_state_feature.shape[0]
-        self._modality_dims: dict[str, int] = {"state": self.config.robot_state_feature.shape[0]}
+        # ------------------------------------------------------------------
+        # Observation encoders and modality dimensions.
+        # ------------------------------------------------------------------
+        raw_modality_dims: dict[str, int] = {"state": self.config.robot_state_feature.shape[0]}
+        self._modality_dims: dict[str, int] = {}
+        global_cond_dim = 0
 
-        # === Standard image encoder (shared for visual images and tac_raw) ===
+        def register_modality(name: str, raw_dim: int, *, allow_projection: bool = True) -> int:
+            """Register a modality and optionally create a projection head."""
+            should_project = (
+                self.modality_projection_dim is not None
+                and allow_projection
+                and (name != "state" or self.project_state)
+            )
+            out_dim = self.modality_projection_dim if should_project else raw_dim
+            if should_project:
+                self.modality_projectors[name] = _make_mlp_projection(raw_dim, out_dim)
+            raw_modality_dims[name] = raw_dim
+            self._modality_dims[name] = out_dim
+            return out_dim
+
+        global_cond_dim += register_modality("state", self.config.robot_state_feature.shape[0], allow_projection=True)
+
         if len(self._rgb_image_keys) > 0:
-            num_images = len(self._rgb_image_keys)
             if self.config.use_separate_rgb_encoder_per_camera:
-                encoders = [DiffusionRgbEncoder(config) for _ in range(num_images)]
-                self.rgb_encoder = nn.ModuleList(encoders)
-                global_cond_dim += encoders[0].feature_dim * num_images
-                rgb_total_dim = encoders[0].feature_dim * num_images
+                self.rgb_encoder = nn.ModuleList(
+                    [DiffusionRgbEncoder(config, image_shape=self.config.enabled_rgb_image_features[key].shape) for key in self._rgb_image_keys]
+                )
+                rgb_raw_dim = self.rgb_encoder[0].feature_dim * len(self._rgb_image_keys)
             else:
-                self.rgb_encoder = DiffusionRgbEncoder(config)
-                global_cond_dim += self.rgb_encoder.feature_dim * num_images
-                rgb_total_dim = self.rgb_encoder.feature_dim * num_images
-            self._modality_dims["rgb"] = rgb_total_dim
+                first_shape = self.config.enabled_rgb_image_features[self._rgb_image_keys[0]].shape
+                self.rgb_encoder = DiffusionRgbEncoder(config, image_shape=first_shape)
+                rgb_raw_dim = self.rgb_encoder.feature_dim * len(self._rgb_image_keys)
+            global_cond_dim += register_modality("rgb", rgb_raw_dim)
 
-        # === Environment state (if present) ===
         if self.config.env_state_feature:
-            global_cond_dim += self.config.env_state_feature.shape[0]
-            self._modality_dims["env_state"] = self.config.env_state_feature.shape[0]
+            global_cond_dim += register_modality("env_state", self.config.env_state_feature.shape[0])
 
-        # === Environment
-        if self.config.has_tactile_raw:
-            self.tactile_raw_encoder = TactileRawEncoder(config)
-            num_tactile_raw = len(self._tactile_raw_keys)
-            tactile_raw_total_dim = self.tactile_raw_encoder.feature_dim * num_tactile_raw
-            global_cond_dim += tactile_raw_total_dim
-            self._modality_dims["tactile_raw"] = tactile_raw_total_dim
+        if self.config.has_tactile_raw and len(self._tactile_raw_keys) > 0:
+            first_raw_shape = self.config.tactile_raw_features[self._tactile_raw_keys[0]].shape
+            self.tactile_raw_encoder = TactileRawEncoder(config, image_shape=first_raw_shape)
+            tactile_raw_dim = self.tactile_raw_encoder.feature_dim * len(self._tactile_raw_keys)
+            global_cond_dim += register_modality("tactile_raw", tactile_raw_dim)
 
-        # === Tactile depth/normal encoder (for depth + normal 4-channel data) ===
-        if self.config.has_tactile_fused:
-            self.tactile_fused_encoder = TactileFusedEncoder(config)
-            num_tactile_fused = min(len(self._tactile_depth_keys), len(self._tactile_normal_keys))
-            tactile_fused_total_dim = self.tactile_fused_encoder.feature_dim * num_tactile_fused
-            global_cond_dim += tactile_fused_total_dim
-            self._modality_dims["tactile_fused"] = tactile_fused_total_dim
+        if self.config.has_tactile_fused and len(self._tactile_fused_pairs) > 0:
+            first_depth_key, _ = self._tactile_fused_pairs[0]
+            first_depth_shape = self.config.tactile_depth_features[first_depth_key].shape
+            self.tactile_fused_encoder = TactileFusedEncoder(config, depth_image_shape=first_depth_shape)
+            tactile_fused_dim = self.tactile_fused_encoder.feature_dim * len(self._tactile_fused_pairs)
+            global_cond_dim += register_modality("tactile_fused", tactile_fused_dim)
 
-        # === Tactile marker encoder (for marker displacement) ===
         if self.config.has_tactile_marker:
             self.tactile_marker_encoder = TactileMarkerEncoder(
                 input_dim=config.tactile_marker_input_dim,
                 embed_dim=config.tactile_marker_embed_dim,
             )
-            global_cond_dim += config.tactile_marker_embed_dim
-            self._modality_dims["tactile_marker"] = config.tactile_marker_embed_dim
+            global_cond_dim += register_modality("tactile_marker", config.tactile_marker_embed_dim)
 
-        # === Optional MoE consensus over modalities ===
+        # Optional feature-level consensus MoE. It receives projected modality
+        # features, so its input dims are exactly `self._modality_dims`.
         if config.use_modal_moe:
             self.modal_moe = MultiModalConsensusMoE(
                 modality_input_dims=self._modality_dims,
@@ -469,7 +678,9 @@ class DiffusionHenryModel(nn.Module):
         else:
             self.modal_moe = None
 
-        # === Denoiser backbone (UNet / DiT) ===
+        # ------------------------------------------------------------------
+        # Denoiser backbone: single denoiser or semantic denoiser MoE.
+        # ------------------------------------------------------------------
         global_cond_total_dim = global_cond_dim * config.n_obs_steps
         if config.denoiser_type == "unet":
             denoiser_ctor = lambda cond_dim: DiffusionConditionalUnet1d(config, global_cond_dim=cond_dim)
@@ -481,11 +692,9 @@ class DiffusionHenryModel(nn.Module):
         if self.use_denoiser_moe:
             self._expert_groups = self._build_denoiser_expert_groups()
             if len(self._expert_groups) == 0:
-                raise ValueError(
-                    "`use_denoiser_moe=True` requires at least one non-state modality feature."
-                )
+                raise ValueError("`use_denoiser_moe=True` requires at least one non-state modality feature.")
 
-            # Expert condition uses [state + grouped modality features] per observation step.
+            self._expert_group_names = list(self._expert_groups.keys())
             self._expert_cond_dims = {
                 group_name: (
                     self._modality_dims["state"]
@@ -497,26 +706,31 @@ class DiffusionHenryModel(nn.Module):
 
             self.denoiser_experts = nn.ModuleList()
             self._denoiser_expert_names: list[str] = []
-            for group_name in self._expert_groups:
+            self._expert_idx_to_group_idx: list[int] = []
+            for group_idx, group_name in enumerate(self._expert_group_names):
                 for module_idx in range(self.denoiser_num_modules):
                     self.denoiser_experts.append(denoiser_ctor(self._expert_cond_dims[group_name]))
-                    self._denoiser_expert_names.append(f"{group_name}_m{module_idx}")
+                    if self.denoiser_num_modules == 1:
+                        self._denoiser_expert_names.append(group_name)
+                    else:
+                        self._denoiser_expert_names.append(f"{group_name}_m{module_idx}")
+                    self._expert_idx_to_group_idx.append(group_idx)
 
             self.weight_predictor = nn.Sequential(
+                nn.LayerNorm(global_cond_total_dim),
                 nn.Linear(global_cond_total_dim, global_cond_total_dim),
-                nn.ReLU(),
+                nn.GELU(),
                 nn.Linear(global_cond_total_dim, len(self.denoiser_experts)),
             )
 
             # Compatibility handle; MoE path does not call this directly.
             self.unet = self.denoiser_experts
         else:
-            denoiser = denoiser_ctor(global_cond_total_dim)
+            self.unet = denoiser_ctor(global_cond_total_dim)
 
-            # Keep `unet` attribute name for compatibility with existing training/inference code paths.
-            self.unet = denoiser
-
-        # === Noise scheduler ===
+        # ------------------------------------------------------------------
+        # Noise scheduler.
+        # ------------------------------------------------------------------
         self.noise_scheduler = _make_noise_scheduler(
             config.noise_scheduler_type,
             num_train_timesteps=config.num_train_timesteps,
@@ -527,17 +741,23 @@ class DiffusionHenryModel(nn.Module):
             clip_sample_range=config.clip_sample_range,
             prediction_type=config.prediction_type,
         )
+        self.num_inference_steps = (
+            self.noise_scheduler.config.num_train_timesteps
+            if config.num_inference_steps is None
+            else config.num_inference_steps
+        )
 
-        if config.num_inference_steps is None:
-            self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
-        else:
-            self.num_inference_steps = config.num_inference_steps
+    def _project_modality(self, name: str, features: Tensor) -> Tensor:
+        """Apply optional per-modality projection."""
+        if name in self.modality_projectors:
+            return self.modality_projectors[name](features)
+        return features
 
     def _build_denoiser_expert_groups(self) -> dict[str, list[str]]:
         """Build denoiser expert groups from available non-state modalities.
 
-        - `modality`: one group per modality (legacy behavior).
-        - `semantic`: three groups [visual, tactile, other].
+        - `modality`: one group per modality.
+        - `semantic`: three interpretable groups: visual, tactile, and other.
         """
         non_state_modalities = [name for name in self._modality_dims.keys() if name != "state"]
         if self.denoiser_grouping_strategy == "modality":
@@ -546,11 +766,7 @@ class DiffusionHenryModel(nn.Module):
         if self.denoiser_grouping_strategy == "semantic":
             visual = [name for name in non_state_modalities if name == "rgb"]
             tactile = [name for name in non_state_modalities if name.startswith("tactile")]
-            other = [
-                name
-                for name in non_state_modalities
-                if name not in visual and name not in tactile
-            ]
+            other = [name for name in non_state_modalities if name not in visual and name not in tactile]
 
             groups: dict[str, list[str]] = {}
             if len(visual) > 0:
@@ -569,33 +785,55 @@ class DiffusionHenryModel(nn.Module):
             return None
         return self.modal_moe.last_inference_routing
 
-    def get_denoiser_moe_debug_info(self) -> dict[str, list[float] | list[str] | int | str] | None:
+    def get_denoiser_moe_debug_info(self) -> dict[str, float | list[float] | list[str] | int | str] | None:
         """Return latest denoiser MoE routing summary captured during inference."""
         return self.last_denoiser_moe_routing
 
+    def _get_denoiser_composition_strategy(self) -> str:
+        """Resolve denoiser MoE strategy by phase.
+
+        Training uses soft-gating for dense gradients. Inference uses the configured
+        strategy. If you want no train/inference mismatch, set the config strategy
+        to `soft_gating` as well.
+        """
+        if self.training:
+            return "soft_gating"
+        return self.denoiser_composition_strategy
+
+    def _effective_denoiser_weights(self, weights: Tensor, strategy: str) -> Tensor:
+        """Convert router logits to effective expert weights of shape (E, B)."""
+        num_experts = weights.shape[0]
+        if strategy == "soft_gating":
+            return F.softmax(weights, dim=0)
+
+        if strategy == "hard_routing":
+            idx = torch.argmax(weights, dim=0)
+            return F.one_hot(idx, num_classes=num_experts).to(weights.dtype).transpose(0, 1)
+
+        if strategy == "topk_moe":
+            k = min(self.denoiser_topk, num_experts)
+            topk_vals, topk_idx = torch.topk(weights, k=k, dim=0)
+            topk_weights = F.softmax(topk_vals, dim=0)
+            effective = torch.zeros_like(weights)
+            effective.scatter_(0, topk_idx, topk_weights)
+            return effective
+
+        raise ValueError(f"Unknown denoiser composition strategy {strategy}")
+
     def _maybe_log_denoiser_moe_weights(self, weights: Tensor) -> None:
-        """Capture and optionally print denoiser MoE routing weights during inference."""
+        """Capture and optionally print denoiser MoE routing diagnostics."""
         if (not self.denoiser_moe_debug_inference) or self.training:
             return
 
         self._denoiser_inference_call_count += 1
-        num_experts = weights.shape[0]
+        strategy = self._get_denoiser_composition_strategy()
+        effective_weights = self._effective_denoiser_weights(weights, strategy)
 
-        if self.denoiser_composition_strategy == "soft_gating":
-            effective_weights = F.softmax(weights, dim=0)
-        elif self.denoiser_composition_strategy == "hard_routing":
-            idx = torch.argmax(weights, dim=0)  # (B,)
-            effective_weights = F.one_hot(idx, num_classes=num_experts).to(weights.dtype).transpose(0, 1)
-        elif self.denoiser_composition_strategy == "topk_moe":
-            k = min(self.denoiser_topk, num_experts)
-            topk_vals, topk_idx = torch.topk(weights, k=k, dim=0)  # (k, B)
-            norm_weights = F.softmax(topk_vals, dim=0)
-            effective_weights = torch.zeros_like(weights)
-            effective_weights.scatter_(0, topk_idx, norm_weights)
-        else:
-            raise ValueError(f"Unknown denoiser composition strategy {self.denoiser_composition_strategy}")
+        mean_weights = effective_weights.detach().mean(dim=1)
+        entropy = -(effective_weights.detach().clamp_min(1e-12) * effective_weights.detach().clamp_min(1e-12).log()).sum(dim=0).mean()
+        top1_idx = effective_weights.detach().argmax(dim=0)
+        top1_ratio = torch.bincount(top1_idx, minlength=effective_weights.shape[0]).float() / top1_idx.numel()
 
-        mean_weights = effective_weights.detach().mean(dim=1)  # (num_experts,)
         report_k = min(self.denoiser_topk, mean_weights.shape[0])
         topk_weights, topk_idx = torch.topk(mean_weights, k=report_k, dim=0)
 
@@ -606,42 +844,32 @@ class DiffusionHenryModel(nn.Module):
 
         self.last_denoiser_moe_routing = {
             "call": self._denoiser_inference_call_count,
-            "strategy": self.denoiser_composition_strategy,
+            "strategy": strategy,
             "topk_experts": topk_experts,
             "topk_weights": topk_weights_list,
             "all_experts": all_experts,
             "all_weights": all_weights,
+            "routing_entropy": float(entropy.cpu()),
+            "top1_expert_ratio": top1_ratio.cpu().tolist(),
         }
 
         if self._denoiser_inference_call_count % self.denoiser_moe_debug_every_n_calls == 0:
             topk_pairs = ", ".join(
                 [f"{name}:{w:.4f}" for name, w in zip(topk_experts, topk_weights_list, strict=True)]
             )
+            msg = (
+                "[denoiser_moe] "
+                f"call={self._denoiser_inference_call_count} strategy={strategy} "
+                f"entropy={float(entropy.cpu()):.4f} topk={topk_pairs}"
+            )
             if self.denoiser_moe_debug_print_full_weights:
-                all_pairs = ", ".join(
-                    [f"{name}:{w:.4f}" for name, w in zip(all_experts, all_weights, strict=True)]
-                )
-                print(
-                    "[denoiser_moe] "
-                    f"call={self._denoiser_inference_call_count} "
-                    f"strategy={self.denoiser_composition_strategy} "
-                    f"topk={topk_pairs} all={all_pairs}"
-                )
-            else:
-                print(
-                    "[denoiser_moe] "
-                    f"call={self._denoiser_inference_call_count} "
-                    f"strategy={self.denoiser_composition_strategy} "
-                    f"topk={topk_pairs}"
-                )
+                all_pairs = ", ".join([f"{name}:{w:.4f}" for name, w in zip(all_experts, all_weights, strict=True)])
+                msg += f" all={all_pairs}"
+            print(msg)
 
-    def _expert_cond_for_expert(
-        self,
-        expert_idx: int,
-        expert_conds: list[Tensor],
-    ) -> Tensor:
-        modality_idx = expert_idx // self.denoiser_num_modules
-        return expert_conds[modality_idx]
+    def _expert_cond_for_expert(self, expert_idx: int, expert_conds: list[Tensor]) -> Tensor:
+        group_idx = self._expert_idx_to_group_idx[expert_idx]
+        return expert_conds[group_idx]
 
     def _predict_with_denoiser_moe(
         self,
@@ -650,62 +878,30 @@ class DiffusionHenryModel(nn.Module):
         expert_conds: list[Tensor],
         weights: Tensor,
     ) -> Tensor:
-        """Predict denoising output with expert composition.
+        """Predict denoising output with denoiser MoE composition.
 
-        Args:
-            trajectory: (B, T, Da)
-            timestep: (B,) long tensor
-            expert_conds: list of per-group conditions, each (B, Dg)
-            weights: (num_experts, B)
+        This version avoids the old per-sample Python loop for hard/top-k routing.
+        It groups samples by expert, so the loop is over experts rather than over
+        every batch element.
         """
-        batch_size = trajectory.shape[0]
+        strategy = self._get_denoiser_composition_strategy()
+        effective_weights = self._effective_denoiser_weights(weights, strategy)
+        pred = torch.zeros_like(trajectory)
 
-        if self.denoiser_composition_strategy == "soft_gating":
-            norm_weights = F.softmax(weights, dim=0)
-            pred = sum(
-                norm_weights[i][:, None, None]
-                * expert(trajectory, timestep, global_cond=self._expert_cond_for_expert(i, expert_conds))
-                for i, expert in enumerate(self.denoiser_experts)
+        for expert_idx, expert in enumerate(self.denoiser_experts):
+            sample_mask = effective_weights[expert_idx] > 0
+            if not torch.any(sample_mask):
+                continue
+
+            cond = self._expert_cond_for_expert(expert_idx, expert_conds)
+            expert_pred = expert(
+                trajectory[sample_mask],
+                timestep[sample_mask],
+                global_cond=cond[sample_mask],
             )
-            return pred
+            pred[sample_mask] += effective_weights[expert_idx, sample_mask][:, None, None] * expert_pred
 
-        if self.denoiser_composition_strategy == "hard_routing":
-            idx = torch.argmax(weights, dim=0)  # (B,)
-            pred = torch.stack(
-                [
-                    self.denoiser_experts[i](
-                        trajectory[b : b + 1],
-                        timestep[b : b + 1],
-                        global_cond=self._expert_cond_for_expert(i, expert_conds)[b : b + 1],
-                    )
-                    for b, i in enumerate(idx)
-                ]
-            ).squeeze(1)
-            return pred
-
-        if self.denoiser_composition_strategy == "topk_moe":
-            k = min(self.denoiser_topk, len(self.denoiser_experts))
-            topk_vals, topk_idx = torch.topk(weights, k=k, dim=0)  # (k, B)
-            norm_weights = F.softmax(topk_vals, dim=0)  # (k, B)
-            pred = torch.zeros_like(trajectory)
-
-            for j in range(k):
-                idx = topk_idx[j]  # (B,)
-                w = norm_weights[j]  # (B,)
-                for b in range(batch_size):
-                    i = idx[b].item()
-                    cond_i = self._expert_cond_for_expert(i, expert_conds)
-                    pred[b] += (
-                        w[b]
-                        * self.denoiser_experts[i](
-                            trajectory[b : b + 1],
-                            timestep[b : b + 1],
-                            global_cond=cond_i[b : b + 1],
-                        ).squeeze(0)
-                    )
-            return pred
-
-        raise ValueError(f"Unknown denoiser composition strategy {self.denoiser_composition_strategy}")
+        return pred
 
     def conditional_sample(
         self,
@@ -720,7 +916,6 @@ class DiffusionHenryModel(nn.Module):
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
 
-        # Sample prior.
         sample = (
             noise
             if noise is not None
@@ -745,11 +940,7 @@ class DiffusionHenryModel(nn.Module):
                     weights=weights,
                 )
             else:
-                model_output = self.unet(
-                    sample,
-                    timestep,
-                    global_cond=global_cond,
-                )
+                model_output = self.unet(sample, timestep, global_cond=global_cond)
             sample = self.noise_scheduler.step(model_output, t, sample, generator=generator).prev_sample
 
         return sample
@@ -759,92 +950,76 @@ class DiffusionHenryModel(nn.Module):
         batch: dict[str, Tensor],
         return_modality_conds: bool = False,
     ) -> Tensor | tuple[Tensor, list[Tensor]]:
-        """Encode all features and concatenate them for global conditioning.
-
-        When `return_modality_conds=True`, also returns per-group expert
-        conditions in the same group order as `self._expert_groups`.
-        """
+        """Encode observations and build global/expert conditions."""
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
-        global_cond_feats = [batch[OBS_STATE]]
-        modality_features: dict[str, Tensor] = {"state": batch[OBS_STATE]}
 
-        # === Extract standard image features ===
+        state_features = self._project_modality("state", batch[OBS_STATE])
+        global_cond_feats = [state_features]
+        modality_features: dict[str, Tensor] = {"state": state_features}
+
         if len(self._rgb_image_keys) > 0:
             if self.config.use_separate_rgb_encoder_per_camera:
                 images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
-                img_features_list = torch.cat(
-                    [
-                        encoder(images)
-                        for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
-                    ]
-                )
+                img_features_list = [
+                    encoder(images)
+                    for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
+                ]
+                img_features_cat = torch.cat(img_features_list, dim=0)
                 img_features = einops.rearrange(
-                    img_features_list, "(n b s) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+                    img_features_cat, "(n b s) d -> b s (n d)", b=batch_size, s=n_obs_steps, n=len(self._rgb_image_keys)
                 )
             else:
-                img_features = self.rgb_encoder(
-                    einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
-                )
+                img_features = self.rgb_encoder(einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ..."))
                 img_features = einops.rearrange(
-                    img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+                    img_features, "(b s n) d -> b s (n d)", b=batch_size, s=n_obs_steps, n=len(self._rgb_image_keys)
                 )
+            img_features = self._project_modality("rgb", img_features)
             global_cond_feats.append(img_features)
             modality_features["rgb"] = img_features
 
-        # === Extract environment state features ===
         if self.config.env_state_feature:
-            global_cond_feats.append(batch[OBS_ENV_STATE])
-            modality_features["env_state"] = batch[OBS_ENV_STATE]
+            env_features = self._project_modality("env_state", batch[OBS_ENV_STATE])
+            global_cond_feats.append(env_features)
+            modality_features["env_state"] = env_features
 
-        # === Extract tactile raw features ===
-        if self.config.has_tactile_raw:
-            tac_raw = batch[OBS_TAC_RAW]  # (B, n_obs_steps, 3, H, W) or (B, n_obs_steps, n_raw, 3, H, W)
+        if self.config.has_tactile_raw and OBS_TAC_RAW in batch:
+            tac_raw = batch[OBS_TAC_RAW]
             if tac_raw.dim() == 5:
-                # Single tactile raw camera
                 tac_raw_features = self.tactile_raw_encoder(einops.rearrange(tac_raw, "b s c h w -> (b s) c h w"))
                 tac_raw_features = einops.rearrange(tac_raw_features, "(b s) d -> b s d", b=batch_size, s=n_obs_steps)
             else:
-                # Multiple tactile raw cameras (B, n_obs_steps, n_raw, 3, H, W)
                 num_raw = tac_raw.shape[2]
                 tac_raw_per_camera = einops.rearrange(tac_raw, "b s n c h w -> n (b s) c h w")
-                raw_features_list = [
-                    self.tactile_raw_encoder(images)
-                    for images in tac_raw_per_camera
-                ]
-                raw_features_stacked = torch.cat(raw_features_list, dim=0)
+                raw_features_list = [self.tactile_raw_encoder(images) for images in tac_raw_per_camera]
+                raw_features_cat = torch.cat(raw_features_list, dim=0)
                 tac_raw_features = einops.rearrange(
-                    raw_features_stacked, "(n b s) d -> b s (n d)", b=batch_size, s=n_obs_steps, n=num_raw
+                    raw_features_cat, "(n b s) d -> b s (n d)", b=batch_size, s=n_obs_steps, n=num_raw
                 )
+            tac_raw_features = self._project_modality("tactile_raw", tac_raw_features)
             global_cond_feats.append(tac_raw_features)
             modality_features["tactile_raw"] = tac_raw_features
 
-        # === Extract tactile fused features (depth + normal) ===
-        if self.config.has_tactile_fused:
-            tac_fused = batch[OBS_TAC_FUSED]  # (B, n_obs_steps, 4, H, W) or (B, n_obs_steps, n_fused, 4, H, W)
+        if self.config.has_tactile_fused and OBS_TAC_FUSED in batch:
+            tac_fused = batch[OBS_TAC_FUSED]
             if tac_fused.dim() == 5:
-                # Single fused pair (depth + normal)
                 tac_fused_flat = einops.rearrange(tac_fused, "b s c h w -> (b s) c h w")
                 tac_fused_features = self.tactile_fused_encoder(tac_fused_flat)
                 tac_fused_features = einops.rearrange(tac_fused_features, "(b s) d -> b s d", b=batch_size, s=n_obs_steps)
             else:
-                # Multiple fused pairs (B, n_obs_steps, n_fused, 4, H, W)
                 num_fused = tac_fused.shape[2]
                 tac_fused_per_sensor = einops.rearrange(tac_fused, "b s n c h w -> n (b s) c h w")
-                fused_features_list = [
-                    self.tactile_fused_encoder(images)
-                    for images in tac_fused_per_sensor
-                ]
-                fused_features_stacked = torch.cat(fused_features_list, dim=0)
+                fused_features_list = [self.tactile_fused_encoder(images) for images in tac_fused_per_sensor]
+                fused_features_cat = torch.cat(fused_features_list, dim=0)
                 tac_fused_features = einops.rearrange(
-                    fused_features_stacked, "(n b s) d -> b s (n d)", b=batch_size, s=n_obs_steps, n=num_fused
+                    fused_features_cat, "(n b s) d -> b s (n d)", b=batch_size, s=n_obs_steps, n=num_fused
                 )
+            tac_fused_features = self._project_modality("tactile_fused", tac_fused_features)
             global_cond_feats.append(tac_fused_features)
             modality_features["tactile_fused"] = tac_fused_features
 
-        # === Extract tactile marker features ===
-        if self.config.has_tactile_marker:
-            tac_marker = batch[OBS_TAC_MARKER]  # (B, n_obs_steps, 70)
-            tac_marker_features = self.tactile_marker_encoder(tac_marker)  # (B, n_obs_steps, embed_dim)
+        if self.config.has_tactile_marker and OBS_TAC_MARKER in batch:
+            tac_marker_features = self.tactile_marker_encoder(batch[OBS_TAC_MARKER])
+            tac_marker_features = self._project_modality("tactile_marker", tac_marker_features)
             global_cond_feats.append(tac_marker_features)
             modality_features["tactile_marker"] = tac_marker_features
 
@@ -852,19 +1027,16 @@ class DiffusionHenryModel(nn.Module):
             consensus_features = self.modal_moe(modality_features)
             global_cond_feats.append(consensus_features)
 
-        # Concatenate features then flatten to (B, global_cond_dim).
         global_cond = torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
 
         if not return_modality_conds:
             return global_cond
-
         if not self.use_denoiser_moe:
             return global_cond, []
 
-        state_feat = modality_features["state"]
         expert_conds = [
             torch.cat(
-                [torch.cat([modality_features[name] for name in names], dim=-1), state_feat],
+                [torch.cat([modality_features[name] for name in names], dim=-1), modality_features["state"]],
                 dim=-1,
             ).flatten(start_dim=1)
             for names in self._expert_groups.values()
@@ -891,16 +1063,12 @@ class DiffusionHenryModel(nn.Module):
             global_cond = self._prepare_global_conditioning(batch)
             actions = self.conditional_sample(batch_size, global_cond=global_cond, noise=noise)
 
-        # Extract n_action_steps worth of actions
         start = n_obs_steps - 1
         end = start + self.config.n_action_steps
-        actions = actions[:, start:end]
-
-        return actions
+        return actions[:, start:end]
 
     def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
         """Compute training loss."""
-        # Input validation
         assert set(batch).issuperset({OBS_STATE, ACTION})
         if self.config.do_mask_loss_for_padding:
             assert "action_is_pad" in batch
@@ -910,14 +1078,12 @@ class DiffusionHenryModel(nn.Module):
         assert horizon == self.config.horizon
         assert n_obs_steps == self.config.n_obs_steps
 
-        # Prepare global conditioning
         if self.use_denoiser_moe:
             global_cond, expert_conds = self._prepare_global_conditioning(batch, return_modality_conds=True)
             weights = self.weight_predictor(global_cond).transpose(0, 1)
         else:
             global_cond = self._prepare_global_conditioning(batch)
 
-        # Forward diffusion
         trajectory = batch[ACTION]
         eps = torch.randn(trajectory.shape, device=trajectory.device)
         timesteps = torch.randint(
@@ -928,7 +1094,6 @@ class DiffusionHenryModel(nn.Module):
         ).long()
         noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
 
-        # Run denoising network
         if self.use_denoiser_moe:
             pred = self._predict_with_denoiser_moe(
                 noisy_trajectory,
@@ -939,7 +1104,6 @@ class DiffusionHenryModel(nn.Module):
         else:
             pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
 
-        # Compute loss
         if self.config.prediction_type == "epsilon":
             target = eps
         elif self.config.prediction_type == "sample":
@@ -949,36 +1113,34 @@ class DiffusionHenryModel(nn.Module):
 
         loss = F.mse_loss(pred, target, reduction="none")
 
-        # Mask loss for padded actions
         if self.config.do_mask_loss_for_padding:
             in_episode_bound = ~batch["action_is_pad"]
             loss = loss * in_episode_bound.unsqueeze(-1)
 
         return loss.mean()
 
-class TactileRawEncoder(nn.Module):
-    """Encodes 3-channel tactile raw data into a feature vector.
-    
-    Uses a ResNet backbone modified to accept 3-channel input, with pretrained
-    weights for the RGB channels.
-    """
 
-    def __init__(self, config:DiffusionHenryConfig):
+# =============================================================================
+# Observation encoders
+# =============================================================================
+class TactileRawEncoder(nn.Module):
+    """Encode 3-channel tactile raw data into a feature vector."""
+
+    def __init__(self, config: DiffusionBaselineConfig, image_shape: tuple[int, ...] | torch.Size | None = None):
         super().__init__()
         self.config = config
 
-        # Set up optional preprocessing (crop)
         if config.tactile_crop_shape is not None:
             self.do_crop = True
             self.center_crop = torchvision.transforms.CenterCrop(config.tactile_crop_shape)
-            if config.crop_is_random:
-                self.maybe_random_crop = torchvision.transforms.RandomCrop(config.tactile_crop_shape)
-            else:
-                self.maybe_random_crop = self.center_crop
+            self.maybe_random_crop = (
+                torchvision.transforms.RandomCrop(config.tactile_crop_shape)
+                if config.crop_is_random
+                else self.center_crop
+            )
         else:
             self.do_crop = False
 
-        # optional preprocessing (resize)
         if config.tactile_resize_shape is not None:
             self.do_resize = True
             self.resize = torchvision.transforms.Resize(config.tactile_resize_shape)
@@ -990,82 +1152,71 @@ class TactileRawEncoder(nn.Module):
         )
         self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
 
-        if config.use_group_norm:
+        if config.tactile_use_group_norm:
             if config.tactile_raw_pretrained_backbone_weights:
-                raise ValueError(
-                    "You can't replace BatchNorm in a pretrained model without ruining the weights!"
-                )
+                raise ValueError("Cannot replace BatchNorm in a pretrained tactile raw backbone.")
             self.backbone = _replace_submodules(
                 root_module=self.backbone,
                 predicate=lambda x: isinstance(x, nn.BatchNorm2d),
                 func=lambda x: nn.GroupNorm(num_groups=x.num_features // 16, num_channels=x.num_features),
             )
 
-        images_shape = next(iter(config.tactile_raw_features.values())).shape
-        # Determine final input shape to backbone (resize has priority over crop)
-        if config.tactile_resize_shape is not None:
-            final_shape_h_w = config.tactile_resize_shape
-        elif config.tactile_crop_shape is not None:
-            final_shape_h_w = config.tactile_crop_shape
-        else:
-            final_shape_h_w = images_shape[1:]
-        dummy_shape = (1, images_shape[0], *final_shape_h_w)
+        if image_shape is None:
+            image_shape = next(iter(config.tactile_raw_features.values())).shape
+        channels, height, width = _infer_image_channels_hw(image_shape)
+        if channels != config.tactile_raw_backbone_in_channels:
+            raise ValueError(
+                f"Tactile raw encoder expected {config.tactile_raw_backbone_in_channels} channels, "
+                f"but got feature shape {tuple(image_shape)}."
+            )
+
+        final_shape_h_w = config.tactile_resize_shape or config.tactile_crop_shape or (height, width)
+        dummy_shape = (1, channels, *final_shape_h_w)
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
-        self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
-        self.feature_dim = config.spatial_softmax_num_keypoints * 2
-        self.out = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
-        self.relu = nn.ReLU()
+        num_kp = config.tactile_spatial_softmax_num_keypoints
+        self.pool = SpatialSoftmax(feature_map_shape, num_kp=num_kp)
+        self.feature_dim = num_kp * 2
+        self.out = nn.Sequential(nn.Linear(self.feature_dim, self.feature_dim), nn.ReLU())
 
     def forward(self, x: Tensor) -> Tensor:
         if self.do_crop:
-            if self.training:
-                x = self.maybe_random_crop(x)
-            else:
-                x = self.center_crop(x)
+            x = self.maybe_random_crop(x) if self.training else self.center_crop(x)
         if self.do_resize:
-            x = self.resize(x)  
+            x = self.resize(x)
 
         x = torch.flatten(self.pool(self.backbone(x)), start_dim=1)
-        x = self.relu(self.out(x))
-        return x
-    
+        return self.out(x)
+
 
 class TactileFusedEncoder(nn.Module):
-    """Encodes 4-channel tactile data (depth + normal) into a feature vector.
+    """Encode 4-channel tactile normal+depth data into a feature vector."""
 
-    Uses a ResNet backbone modified to accept 4-channel input, with pretrained
-    weights for the RGB channels and mean-initialized weights for the depth channel.
-    """
-
-    def __init__(self, config: DiffusionHenryConfig):
+    def __init__(self, config: DiffusionBaselineConfig, depth_image_shape: tuple[int, ...] | torch.Size | None = None):
         super().__init__()
         self.config = config
 
-        # Set up optional preprocessing (crop)
         if config.tactile_crop_shape is not None:
             self.do_crop = True
             self.center_crop = torchvision.transforms.CenterCrop(config.tactile_crop_shape)
-            if config.crop_is_random:
-                self.maybe_random_crop = torchvision.transforms.RandomCrop(config.tactile_crop_shape)
-            else:
-                self.maybe_random_crop = self.center_crop
+            self.maybe_random_crop = (
+                torchvision.transforms.RandomCrop(config.tactile_crop_shape)
+                if config.crop_is_random
+                else self.center_crop
+            )
         else:
             self.do_crop = False
 
-        # optional preprocessing (resize)
         if config.tactile_resize_shape is not None:
             self.do_resize = True
             self.resize = torchvision.transforms.Resize(config.tactile_resize_shape)
         else:
             self.do_resize = False
 
-        # Set up backbone with 4-channel input
         backbone_model = getattr(torchvision.models, config.tactile_fused_backbone)(
             weights=config.tactile_fused_pretrained_backbone_weights
         )
 
-        # Modify first conv layer to accept 4 channels
         original_conv = backbone_model.conv1
         new_conv = nn.Conv2d(
             config.tactile_fused_backbone_in_channels,
@@ -1076,90 +1227,56 @@ class TactileFusedEncoder(nn.Module):
             bias=original_conv.bias is not None,
         )
 
-        # Initialize weights: copy RGB weights, init depth channel with mean
         with torch.no_grad():
             if config.tactile_fused_pretrained_backbone_weights is not None:
-                # Copy RGB weights (first 3 channels)
                 new_conv.weight[:, :3] = original_conv.weight[:, :3]
-                # Initialize additional channels with mean of RGB weights
                 for i in range(3, config.tactile_fused_backbone_in_channels):
-                    new_conv.weight[:, i:i+1] = original_conv.weight.mean(dim=1, keepdim=True)
+                    new_conv.weight[:, i : i + 1] = original_conv.weight.mean(dim=1, keepdim=True)
             else:
-                nn.init.kaiming_normal_(new_conv.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_normal_(new_conv.weight, mode="fan_out", nonlinearity="relu")
+                if new_conv.bias is not None:
+                    nn.init.zeros_(new_conv.bias)
 
         backbone_model.conv1 = new_conv
-
-        # Remove final FC layers, keep feature extraction part
         self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
 
-        # Optionally replace BatchNorm with GroupNorm
         if config.tactile_use_group_norm:
+            if config.tactile_fused_pretrained_backbone_weights:
+                raise ValueError("Cannot replace BatchNorm in a pretrained tactile fused backbone.")
             self.backbone = _replace_submodules(
                 root_module=self.backbone,
                 predicate=lambda x: isinstance(x, nn.BatchNorm2d),
                 func=lambda x: nn.GroupNorm(num_groups=x.num_features // 16, num_channels=x.num_features),
             )
 
-        # Set up pooling and final layers
-        # Get tactile image shape from config
-        if config.has_tactile_fused:
-            depth_features = config.tactile_depth_features
-            if len(depth_features) > 0:
-                first_depth_ft = next(iter(depth_features.values()))
-                # Shape is (H, W, 1) for depth
-                h, w = first_depth_ft.shape[0], first_depth_ft.shape[1]
-            else:
-                # Default
-                h, w = 480, 640
+        if depth_image_shape is None and config.tactile_depth_features:
+            depth_image_shape = next(iter(config.tactile_depth_features.values())).shape
+        if depth_image_shape is None:
+            _, height, width = 1, 480, 640
         else:
-            h, w = 480, 640
+            _, height, width = _infer_image_channels_hw(depth_image_shape)
 
-        # Determine final input shape to backbone (resize has priority over crop)
-        if config.tactile_resize_shape is not None:
-            final_shape_h_w = config.tactile_resize_shape
-        elif config.tactile_crop_shape is not None:
-            final_shape_h_w = config.tactile_crop_shape
-        else:
-            final_shape_h_w = (h, w)
+        final_shape_h_w = config.tactile_resize_shape or config.tactile_crop_shape or (height, width)
         dummy_shape = (1, config.tactile_fused_backbone_in_channels, *final_shape_h_w)
-        # get final out put shape
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
-        # Use spatial softmax to extract keypoints
-        self.spatial_pool = SpatialSoftmax(feature_map_shape, num_kp=config.tactile_spatial_softmax_num_keypoints)
-        # Use global average pooling to extract tactile depth features
+        num_kp = config.tactile_spatial_softmax_num_keypoints
+        self.spatial_pool = SpatialSoftmax(feature_map_shape, num_kp=num_kp)
         self.global_pool = nn.AdaptiveAvgPool2d(1)
 
-        self.feature_dim = config.tactile_spatial_softmax_num_keypoints * 2 + feature_map_shape[0]
-        self.out = nn.Linear(config.tactile_spatial_softmax_num_keypoints * 2 + feature_map_shape[0], self.feature_dim)
-        self.relu = nn.ReLU()
+        self.feature_dim = num_kp * 2 + feature_map_shape[0]
+        self.out = nn.Sequential(nn.Linear(self.feature_dim, self.feature_dim), nn.ReLU())
 
     def forward(self, x: Tensor) -> Tensor:
-        """
-        Args:
-            x: (B, 4, H, W) tactile tensor (normal + depth channels).
-        Returns:
-            (B, D) tactile feature.
-        """
         if self.do_crop:
-            if self.training:
-                x = self.maybe_random_crop(x)
-            else:
-                x = self.center_crop(x)
-
+            x = self.maybe_random_crop(x) if self.training else self.center_crop(x)
         if self.do_resize:
             x = self.resize(x)
-        
-        x = self.backbone(x)
 
-        # apply sptial pool and avg pool
+        x = self.backbone(x)
         keypoint_coords = torch.flatten(self.spatial_pool(x), start_dim=1)
         scale_features = torch.flatten(self.global_pool(x), start_dim=1)
-
-        x = torch.cat([keypoint_coords, scale_features], dim=-1)
-
-        x = self.relu(self.out(x))
-        return x
+        return self.out(torch.cat([keypoint_coords, scale_features], dim=-1))
 
 
 class TactileMarkerEncoder(nn.Module):
@@ -1223,18 +1340,19 @@ class SpatialSoftmax(nn.Module):
 
 
 class DiffusionRgbEncoder(nn.Module):
-    """Encodes an RGB image into a 1D feature vector."""
+    """Encode an RGB image into a 1D feature vector."""
 
-    def __init__(self, config: DiffusionHenryConfig):
+    def __init__(self, config: DiffusionBaselineConfig, image_shape: tuple[int, ...] | torch.Size | None = None):
         super().__init__()
 
         if config.crop_shape is not None:
             self.do_crop = True
             self.center_crop = torchvision.transforms.CenterCrop(config.crop_shape)
-            if config.crop_is_random:
-                self.maybe_random_crop = torchvision.transforms.RandomCrop(config.crop_shape)
-            else:
-                self.maybe_random_crop = self.center_crop
+            self.maybe_random_crop = (
+                torchvision.transforms.RandomCrop(config.crop_shape)
+                if config.crop_is_random
+                else self.center_crop
+            )
         else:
             self.do_crop = False
 
@@ -1244,51 +1362,44 @@ class DiffusionRgbEncoder(nn.Module):
         else:
             self.do_resize = False
 
-        backbone_model = getattr(torchvision.models, config.vision_backbone)(
-            weights=config.pretrained_backbone_weights
-        )
+        backbone_model = getattr(torchvision.models, config.vision_backbone)(weights=config.pretrained_backbone_weights)
         self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
 
         if config.use_group_norm:
             if config.pretrained_backbone_weights:
-                raise ValueError(
-                    "You can't replace BatchNorm in a pretrained model without ruining the weights!"
-                )
+                raise ValueError("Cannot replace BatchNorm in a pretrained RGB backbone.")
             self.backbone = _replace_submodules(
                 root_module=self.backbone,
                 predicate=lambda x: isinstance(x, nn.BatchNorm2d),
                 func=lambda x: nn.GroupNorm(num_groups=x.num_features // 16, num_channels=x.num_features),
             )
 
-        if config.image_features:
-            images_shape = next(iter(config.image_features.values())).shape
-            # Determine final input shape to backbone (resize has priority over crop)
-            if config.resize_shape is not None:
-                final_shape_h_w = config.resize_shape
-            elif config.crop_shape is not None:
-                final_shape_h_w = config.crop_shape
-            else:
-                final_shape_h_w = images_shape[1:]
-            dummy_shape = (1, images_shape[0], *final_shape_h_w)
-            feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
+        if image_shape is None:
+            rgb_shapes = [ft.shape for ft in config.enabled_rgb_image_features.values()]
+            if len(rgb_shapes) == 0:
+                raise ValueError("DiffusionRgbEncoder requires at least one enabled non-tactile RGB image feature.")
+            image_shape = rgb_shapes[0]
+
+        channels, height, width = _infer_image_channels_hw(image_shape)
+        if channels != 3:
+            raise ValueError(f"RGB encoder expected 3 channels, but got feature shape {tuple(image_shape)}.")
+
+        final_shape_h_w = config.resize_shape or config.crop_shape or (height, width)
+        dummy_shape = (1, channels, *final_shape_h_w)
+        feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
         self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
         self.feature_dim = config.spatial_softmax_num_keypoints * 2
-        self.out = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
-        self.relu = nn.ReLU()
+        self.out = nn.Sequential(nn.Linear(self.feature_dim, self.feature_dim), nn.ReLU())
 
     def forward(self, x: Tensor) -> Tensor:
         if self.do_crop:
-            if self.training:
-                x = self.maybe_random_crop(x)
-            else:
-                x = self.center_crop(x)
+            x = self.maybe_random_crop(x) if self.training else self.center_crop(x)
         if self.do_resize:
-            x = self.resize(x)  
+            x = self.resize(x)
 
         x = torch.flatten(self.pool(self.backbone(x)), start_dim=1)
-        x = self.relu(self.out(x))
-        return x
+        return self.out(x)
 
 
 def _replace_submodules(
@@ -1316,6 +1427,10 @@ def _replace_submodules(
     assert not any(predicate(m) for _, m in root_module.named_modules(remove_duplicate=True))
     return root_module
 
+
+# =============================================================================
+# Denoisers: timestep embedding, UNet, and DiT
+# =============================================================================
 
 class DiffusionSinusoidalPosEmb(nn.Module):
     """1D sinusoidal positional embeddings."""
@@ -1352,7 +1467,7 @@ class DiffusionConv1dBlock(nn.Module):
 class DiffusionConditionalUnet1d(nn.Module):
     """A 1D convolutional UNet with FiLM modulation for conditioning."""
 
-    def __init__(self, config: DiffusionHenryConfig, global_cond_dim: int):
+    def __init__(self, config: DiffusionBaselineConfig, global_cond_dim: int):
         super().__init__()
         self.config = config
 
@@ -1455,7 +1570,7 @@ def _modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
 
 
 class DiffusionDiTBlock1d(nn.Module):
-    """A lightweight DiT block with AdaLN modulation and gated residuals."""
+    """A lightweight DiT block with AdaLN-Zero modulation and gated residuals."""
 
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float):
         super().__init__()
@@ -1470,6 +1585,13 @@ class DiffusionDiTBlock1d(nn.Module):
             nn.Dropout(dropout),
         )
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(d_model, 6 * d_model))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        # AdaLN-Zero: each block initially behaves close to identity, which tends
+        # to stabilize DiT denoiser training on small robot datasets.
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
 
     def forward(self, x: Tensor, cond: Tensor) -> Tensor:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(cond).chunk(6, dim=-1)
@@ -1485,13 +1607,20 @@ class DiffusionDiTBlock1d(nn.Module):
 
 
 class DiffusionDiTFinalLayer1d(nn.Module):
-    """DiT output layer with AdaLN modulation."""
+    """DiT output layer with AdaLN-Zero modulation."""
 
     def __init__(self, d_model: int, out_dim: int):
         super().__init__()
         self.norm_final = nn.LayerNorm(d_model)
         self.linear = nn.Linear(d_model, out_dim)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(d_model, 2 * d_model))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+        nn.init.zeros_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
 
     def forward(self, x: Tensor, cond: Tensor) -> Tensor:
         shift, scale = self.adaLN_modulation(cond).chunk(2, dim=-1)
@@ -1500,9 +1629,15 @@ class DiffusionDiTFinalLayer1d(nn.Module):
 
 
 class DiffusionConditionalDiT1d(nn.Module):
-    """DiT-style 1D denoiser for action diffusion."""
+    """DiT-style 1D denoiser for action diffusion.
 
-    def __init__(self, config: DiffusionHenryConfig, global_cond_dim: int):
+    Conditioning path:
+        timestep_emb + global_cond -> concat -> cond_proj -> cond
+
+    The resulting `cond` modulates every DiT block through AdaLN-Zero.
+    """
+
+    def __init__(self, config: DiffusionBaselineConfig, global_cond_dim: int):
         super().__init__()
         self.config = config
 
@@ -1517,7 +1652,7 @@ class DiffusionConditionalDiT1d(nn.Module):
         d_model = config.dit_d_model
 
         self.input_proj = nn.Linear(config.action_feature.shape[0], d_model)
-        self.cond_proj = nn.Sequential(nn.Mish(), nn.Linear(cond_dim, d_model))
+        self.cond_proj = nn.Sequential(nn.LayerNorm(cond_dim), nn.Linear(cond_dim, d_model), nn.Mish())
         self.pos_emb = nn.Parameter(torch.zeros(1, config.horizon, d_model))
 
         self.blocks = nn.ModuleList(
@@ -1534,14 +1669,12 @@ class DiffusionConditionalDiT1d(nn.Module):
         self.final_layer = DiffusionDiTFinalLayer1d(d_model, config.action_feature.shape[0])
 
         nn.init.normal_(self.pos_emb, std=0.02)
+        nn.init.xavier_uniform_(self.input_proj.weight)
+        nn.init.zeros_(self.input_proj.bias)
 
     def forward(self, x: Tensor, timestep: Tensor | int, global_cond: Tensor | None = None) -> Tensor:
         timesteps_embed = self.diffusion_step_encoder(timestep)
-        if global_cond is not None:
-            global_feature = torch.cat([timesteps_embed, global_cond], axis=-1)
-        else:
-            global_feature = timesteps_embed
-
+        global_feature = torch.cat([timesteps_embed, global_cond], axis=-1) if global_cond is not None else timesteps_embed
         cond = self.cond_proj(global_feature)
 
         h = self.input_proj(x)

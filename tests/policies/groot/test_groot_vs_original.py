@@ -25,9 +25,9 @@ import numpy as np
 import pytest
 import torch
 
-from lerobot.policies.groot.configuration_groot import GrootConfig
-from lerobot.policies.groot.modeling_groot import GrootPolicy
-from lerobot.policies.groot.processor_groot import make_groot_pre_post_processors
+from lerobot.policies.diffusion_sparsh.groot.configuration_groot import GrootConfig
+from lerobot.policies.diffusion_sparsh.groot.modeling_groot import GrootPolicy
+from lerobot.policies.diffusion_sparsh.groot.processor_groot import make_groot_pre_post_processors
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline
 
 pytest.importorskip("gr00t")

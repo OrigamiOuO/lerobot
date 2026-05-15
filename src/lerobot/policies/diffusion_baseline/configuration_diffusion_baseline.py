@@ -2,7 +2,7 @@
 
 # Copyright 2024 Columbia Artificial Intelligence, Robotics Lab,
 # and The HuggingFace Inc. team. All rights reserved.
-# Modified for Diffusion-Henry tactile adaptation.
+# Modified for Diffusion-Baseline tactile adaptation.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Configuration class for DiffusionHenryPolicy with tactile sensor support."""
+"""Configuration class for DiffusionBaselinePolicy with tactile sensor support."""
 
 from dataclasses import dataclass, field
 
@@ -25,10 +25,68 @@ from lerobot.optim.optimizers import AdamConfig
 from lerobot.optim.schedulers import DiffuserSchedulerConfig
 
 
-@PreTrainedConfig.register_subclass("diffusion_henry")
+TACTILE_RAW_PREFIXES = (
+    "observation.images.tac_raw.",
+    "observation.tac_raw.",
+)
+TACTILE_DEPTH_PREFIXES = (
+    "observation.images.tac_depth.",
+    "observation.tac_depth.",
+)
+TACTILE_NORMAL_PREFIXES = (
+    "observation.images.tac_normal.",
+    "observation.tac_normal.",
+)
+TACTILE_MARKER_PREFIXES = (
+    "observation.tac_marker_displacement.",
+)
+TACTILE_IMAGE_PREFIXES = (
+    *TACTILE_RAW_PREFIXES,
+    *TACTILE_DEPTH_PREFIXES,
+    *TACTILE_NORMAL_PREFIXES,
+)
+TACTILE_PREFIXES = (
+    *TACTILE_IMAGE_PREFIXES,
+    *TACTILE_MARKER_PREFIXES,
+)
+WRIST_RGB_KEYWORDS = (
+    "wrist",
+    "inhand",
+    "in_hand",
+    "hand_eye",
+    "handeye",
+    "ee_camera",
+    "end_effector",
+)
+
+
+def _starts_with_any(key: str, prefixes: tuple[str, ...]) -> bool:
+    return any(key.startswith(prefix) for prefix in prefixes)
+
+
+def _is_tactile_feature_key(key: str) -> bool:
+    return _starts_with_any(key, TACTILE_PREFIXES)
+
+
+def _is_tactile_image_feature_key(key: str) -> bool:
+    return _starts_with_any(key, TACTILE_IMAGE_PREFIXES)
+
+
+def _is_wrist_rgb_feature_key(key: str) -> bool:
+    """Return whether a non-tactile RGB key should be treated as wrist/in-hand RGB.
+
+    Keys not matching these wrist/in-hand keywords are treated as global/external
+    RGB. This keeps common keys such as ``observation.images.global`` and
+    ``observation.images.front`` under ``use_global_rgb``.
+    """
+    key_lower = key.lower()
+    return any(keyword in key_lower for keyword in WRIST_RGB_KEYWORDS)
+
+
+@PreTrainedConfig.register_subclass("diffusion_baseline")
 @dataclass
-class DiffusionHenryConfig(PreTrainedConfig):
-    """Configuration class for DiffusionHenryPolicy with tactile sensor support.
+class DiffusionBaselineConfig(PreTrainedConfig):
+    """Configuration class for DiffusionBaselinePolicy with tactile sensor support.
 
     Extends the original Diffusion Policy to handle:
     - Standard images (global, inhand, tac_raw) via shared ResNet backbone
@@ -45,8 +103,19 @@ class DiffusionHenryConfig(PreTrainedConfig):
         tactile_marker_embed_dim: Output dimension for tactile marker encoder.
     """
 
-    # Whether to use tactile sensor data. Set to False for ablation without tactile.
+    # Backward-compatible master switch for all tactile streams.
+    # If False, tac RGB, tac fusion and marker motion are all ignored by the model,
+    # but `input_features` is kept unchanged so the dataset can still contain them.
     use_tactile: bool = True
+
+    # === Modality switches for ablation ===
+    # The dataset may contain all five streams. These flags only decide whether
+    # each stream is packed/encoded into the policy condition during training and inference.
+    use_global_rgb: bool = True
+    use_wrist_rgb: bool = True
+    use_tac_rgb: bool = True
+    use_tac_fusion: bool = True
+    use_marker_motion: bool = True
 
     # Inputs / output structure.
     n_obs_steps: int = 2
@@ -96,6 +165,12 @@ class DiffusionHenryConfig(PreTrainedConfig):
     tactile_marker_input_dim: int = 70  # 35 markers × 2 coordinates
     tactile_marker_embed_dim: int = 16  # Output dimension (similar to state_dim)
 
+    # Optional per-modality projection before concatenating global_cond.
+    # This keeps high-dimensional tactile_fused features from dominating RGB/state.
+    # Set to None to preserve the original raw feature dimensions.
+    modality_projection_dim: int | None = 128
+    project_state_condition: bool = False
+
     # === Optional multi-modal consensus MoE ===
     use_modal_moe: bool = False
     moe_num_experts: int = 2
@@ -110,10 +185,14 @@ class DiffusionHenryConfig(PreTrainedConfig):
     # === Optional denoiser-level MoE (dp_unets_spec-style) ===
     # Build multiple denoiser experts per non-state modality and combine their
     # predictions with learned routing weights.
-    use_denoiser_moe: bool = True
-    denoiser_num_modules: int = 2
-    denoiser_composition_strategy: str = "topk_moe"  # one of ["soft_gating", "hard_routing", "topk_moe"]
-    denoiser_topk: int = 2
+    # Start from the single-denoiser baseline by default. Enable this only after
+    # tactile-DiT baselines are stable and interpretable.
+    use_denoiser_moe: bool = False
+    # If enabled with semantic grouping, one module per group corresponds to:
+    # visual expert, tactile expert, and optional other expert.
+    denoiser_num_modules: int = 1
+    denoiser_composition_strategy: str = "soft_gating"  # one of ["soft_gating", "hard_routing", "topk_moe"]
+    denoiser_topk: int = 1
     denoiser_grouping_strategy: str = "semantic"  # one of ["modality", "semantic"]
     denoiser_moe_debug_inference: bool = True
     denoiser_moe_debug_every_n_calls: int = 5
@@ -128,10 +207,12 @@ class DiffusionHenryConfig(PreTrainedConfig):
     use_film_scale_modulation: bool = True
 
     # === DiT ===
-    dit_d_model: int = 512
+    # Smaller default DiT for small robot/tactile datasets. Scale back up after
+    # the simple baseline is stable.
+    dit_d_model: int = 256
     dit_nhead: int = 8
-    dit_num_layers: int = 8
-    dit_dim_feedforward: int = 2048
+    dit_num_layers: int = 4
+    dit_dim_feedforward: int = 1024
     dit_dropout: float = 0.1
 
     # === Noise scheduler ===
@@ -197,6 +278,12 @@ class DiffusionHenryConfig(PreTrainedConfig):
             raise ValueError(
                 "`dit_d_model` must be divisible by `dit_nhead`. "
                 f"Got {self.dit_d_model=} and {self.dit_nhead=}."
+            )
+
+        if self.modality_projection_dim is not None and self.modality_projection_dim < 1:
+            raise ValueError(
+                "`modality_projection_dim` must be None or a positive integer. "
+                f"Got {self.modality_projection_dim}."
             )
 
         if self.use_modal_moe:
@@ -289,39 +376,38 @@ class DiffusionHenryConfig(PreTrainedConfig):
         )
 
     def validate_features(self) -> None:
-        """Validate that all required features are present."""
-        # When use_tactile=False, remove all tactile-related input features for ablation.
-        if not self.use_tactile and self.input_features:
-            tactile_prefixes = (
-                "observation.images.tac_raw.",
-                "observation.tac_raw.",
-                "observation.images.tac_depth.",
-                "observation.tac_depth.",
-                "observation.images.tac_normal.",
-                "observation.tac_normal.",
-                "observation.tac_marker_displacement.",
-            )
-            self.input_features = {
-                k: v for k, v in self.input_features.items()
-                if not any(k.startswith(p) for p in tactile_prefixes)
-            }
+        """Validate that all required features are present.
+
+        Unlike the original Diffusion Policy, tactile raw/depth/normal streams may
+        also appear as image-like features. They are intentionally excluded from
+        the standard RGB image shape check because they are processed by separate
+        tactile branches.
+        """
+        # Do not mutate `input_features` for ablation. The dataset can keep all
+        # streams; modality switches only affect which features are used by the model.
+        rgb_image_features = self.enabled_rgb_image_features
 
         if self.crop_shape is not None:
-            for key, image_ft in self.image_features.items():
-                if self.crop_shape[0] > image_ft.shape[1] or self.crop_shape[1] > image_ft.shape[2]:
+            for key, image_ft in rgb_image_features.items():
+                # Support both channel-first (C,H,W) and channel-last (H,W,C).
+                if image_ft.shape[0] in (1, 3, 4):
+                    height, width = image_ft.shape[1], image_ft.shape[2]
+                else:
+                    height, width = image_ft.shape[0], image_ft.shape[1]
+                if self.crop_shape[0] > height or self.crop_shape[1] > width:
                     raise ValueError(
-                        f"`crop_shape` should fit within the images shapes. Got {self.crop_shape} "
-                        f"for `crop_shape` and {image_ft.shape} for `{key}`."
+                        f"`crop_shape` should fit within RGB image shapes. Got {self.crop_shape} "
+                        f"for `{key}` with shape {image_ft.shape}."
                     )
 
-        # Check that all input images have the same shape.
-        if len(self.image_features) > 0:
-            first_image_key, first_image_ft = next(iter(self.image_features.items()))
-            for key, image_ft in self.image_features.items():
+        if len(rgb_image_features) > 0:
+            first_image_key, first_image_ft = next(iter(rgb_image_features.items()))
+            for key, image_ft in rgb_image_features.items():
                 if image_ft.shape != first_image_ft.shape:
                     raise ValueError(
                         f"`{key}` does not match `{first_image_key}`, "
-                        "but we expect all image shapes to match."
+                        "but we expect standard RGB image shapes to match. Tactile image-like "
+                        "features are excluded from this check."
                     )
 
     @property
@@ -336,83 +422,139 @@ class DiffusionHenryConfig(PreTrainedConfig):
     def reward_delta_indices(self) -> None:
         return None
 
-    # === Tactile feature properties ===
+    # === Active feature properties used by the policy ===
 
     @property
-    def tactile_raw_features(self) -> dict[str, PolicyFeature]:
-        """Return features for raw tactile images (legacy support)."""
+    def rgb_image_features(self) -> dict[str, PolicyFeature]:
+        """Return all non-tactile RGB image features present in the dataset config."""
         if not self.input_features:
             return {}
         return {
             key: ft
+            for key, ft in self.image_features.items()
+            if not _is_tactile_feature_key(key)
+        }
+
+    @property
+    def global_rgb_features(self) -> dict[str, PolicyFeature]:
+        """Return external/global RGB streams.
+
+        Non-tactile RGB keys that are not recognized as wrist/in-hand cameras are
+        treated as global RGB, so keys such as ``observation.images.global`` or
+        ``observation.images.front`` are covered by ``use_global_rgb``.
+        """
+        return {
+            key: ft
+            for key, ft in self.rgb_image_features.items()
+            if not _is_wrist_rgb_feature_key(key)
+        }
+
+    @property
+    def wrist_rgb_features(self) -> dict[str, PolicyFeature]:
+        """Return wrist/in-hand RGB streams."""
+        return {
+            key: ft
+            for key, ft in self.rgb_image_features.items()
+            if _is_wrist_rgb_feature_key(key)
+        }
+
+    @property
+    def enabled_rgb_image_features(self) -> dict[str, PolicyFeature]:
+        """Return standard RGB streams enabled for the current ablation setting.
+
+        The original dataset feature order is preserved after filtering, which
+        keeps camera packing deterministic across ablation runs.
+        """
+        return {
+            key: ft
+            for key, ft in self.rgb_image_features.items()
+            if (self.use_wrist_rgb and _is_wrist_rgb_feature_key(key))
+            or (self.use_global_rgb and not _is_wrist_rgb_feature_key(key))
+        }
+
+    @property
+    def tactile_raw_features(self) -> dict[str, PolicyFeature]:
+        """Return active raw tactile RGB image features."""
+        if not (self.use_tactile and self.use_tac_rgb) or not self.input_features:
+            return {}
+        return {
+            key: ft
             for key, ft in self.input_features.items()
-            if key.startswith("observation.images.tac_raw.") or key.startswith("observation.tac_raw.")
+            if _starts_with_any(key, TACTILE_RAW_PREFIXES)
         }
 
     @property
     def tactile_depth_features(self) -> dict[str, PolicyFeature]:
-        """Return features for tactile depth data.
+        """Return active tactile depth features used for tac_fusion.
 
         Supports both legacy keys (``observation.tac_depth.*``) and
         video/image-stream keys (``observation.images.tac_depth.*``).
         """
-        if not self.input_features:
+        if not (self.use_tactile and self.use_tac_fusion) or not self.input_features:
             return {}
         return {
             key: ft
             for key, ft in self.input_features.items()
-            if key.startswith("observation.tac_depth.") or key.startswith("observation.images.tac_depth.")
+            if _starts_with_any(key, TACTILE_DEPTH_PREFIXES)
         }
 
     @property
     def tactile_normal_features(self) -> dict[str, PolicyFeature]:
-        """Return features for tactile normal data.
+        """Return active tactile normal features used for tac_fusion.
 
         Supports both legacy keys (``observation.tac_normal.*``) and
         video/image-stream keys (``observation.images.tac_normal.*``).
         """
-        if not self.input_features:
+        if not (self.use_tactile and self.use_tac_fusion) or not self.input_features:
             return {}
         return {
             key: ft
             for key, ft in self.input_features.items()
-            if key.startswith("observation.tac_normal.") or key.startswith("observation.images.tac_normal.")
+            if _starts_with_any(key, TACTILE_NORMAL_PREFIXES)
         }
 
     @property
     def tactile_marker_features(self) -> dict[str, PolicyFeature]:
-        """Return features for tactile marker displacement data."""
-        if not self.input_features:
+        """Return active marker displacement features."""
+        if not (self.use_tactile and self.use_marker_motion) or not self.input_features:
             return {}
         return {
             key: ft
             for key, ft in self.input_features.items()
-            if key.startswith("observation.tac_marker_displacement.")
+            if _starts_with_any(key, TACTILE_MARKER_PREFIXES)
         }
 
+    @property
+    def has_global_rgb(self) -> bool:
+        """Check if global RGB is enabled and present."""
+        return self.use_global_rgb and len(self.global_rgb_features) > 0
 
+    @property
+    def has_wrist_rgb(self) -> bool:
+        """Check if wrist/in-hand RGB is enabled and present."""
+        return self.use_wrist_rgb and len(self.wrist_rgb_features) > 0
 
     @property
     def has_tactile_raw(self) -> bool:
-        """Check if raw tactile image data is present."""
+        """Check if raw tactile image data is enabled and present."""
         return len(self.tactile_raw_features) > 0
 
     @property
     def has_tactile_depth(self) -> bool:
-        """Check if tactile depth data is present."""
+        """Check if tactile depth data is enabled and present."""
         return len(self.tactile_depth_features) > 0
 
     @property
     def has_tactile_normal(self) -> bool:
-        """Check if tactile normal data is present."""
+        """Check if tactile normal data is enabled and present."""
         return len(self.tactile_normal_features) > 0
 
     @property
     def has_tactile_fused(self) -> bool:
-        """Check if tactile vision data (depth + normal) is present."""
+        """Check if tactile fusion data (depth + normal) is enabled and present."""
         return len(self.tactile_depth_features) > 0 and len(self.tactile_normal_features) > 0
 
     @property
     def has_tactile_marker(self) -> bool:
-        """Check if tactile marker displacement data is present."""
+        """Check if marker displacement data is enabled and present."""
         return len(self.tactile_marker_features) > 0

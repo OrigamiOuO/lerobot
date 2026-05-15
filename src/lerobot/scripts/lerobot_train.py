@@ -436,6 +436,18 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                             "rabc_num_frames": rabc_stats["num_frames"],
                         }
                     )
+                # Log denoiser MoE expert weights (tactile importance analysis)
+                if hasattr(policy, 'model') and hasattr(policy.model, 'get_denoiser_moe_debug_info'):
+                    routing = policy.model.get_denoiser_moe_debug_info()
+                    if routing is not None:
+                        for name, weight in zip(routing.get('all_experts', []), routing.get('all_weights', [])):
+                            wandb_log_dict[f"moe_expert_weight/{name}"] = weight
+                # Log modal MoE modality weights
+                if hasattr(policy, 'model') and hasattr(policy.model, 'get_modal_moe_debug_info'):
+                    modal_routing = policy.model.get_modal_moe_debug_info()
+                    if modal_routing is not None:
+                        for name, weight in zip(modal_routing.get('all_modalities', []), modal_routing.get('all_weights', [])):
+                            wandb_log_dict[f"moe_modal_weight/{name}"] = weight
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 
