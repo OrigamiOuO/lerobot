@@ -31,6 +31,7 @@ from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 from .tactile_pointnet_diffusion.configuration_tactile_pointnet_diffusion import TactilePointnetDiffusionConfig as TactilePointnetDiffusionConfig
 from .pretrain_diffusion.configuration_pretrain_diffusion import PretrainDiffusionConfig as PretrainDiffusionConfig
 from .pretrain_act.configuration_pretrain_act import PretrainACTConfig as PretrainACTConfig
+from .pretrain_mlp.configuration_pretrain_mlp import PretrainMLPConfig as PretrainMLPConfig
 
 __all__ = [
     "ACTConfig",
@@ -54,4 +55,5 @@ __all__ = [
     "TactilePointnetDiffusionConfig",
     "PretrainDiffusionConfig",
     "PretrainACTConfig",
+    "PretrainMLPConfig",
 ]
