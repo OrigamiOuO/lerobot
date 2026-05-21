@@ -32,10 +32,9 @@ from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.diffusion_dino.configuration_diffusion_dino import DiffusionDinoConfig
-from lerobot.policies.diffusion_attention.configuration_diffusion_attention import DiffusionAttentionConfig
 from lerobot.policies.diffusion_baseline.configuration_diffusion_baseline import DiffusionBaselineConfig
 from lerobot.policies.diffusion_sparsh.configuration_diffusion_sparsh import DiffusionSparshConfig
-from lerobot.policies.diffusion_sparsh.groot.configuration_groot import GrootConfig
+from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 
@@ -125,7 +124,7 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
 
         return SARMRewardModel
     elif name == "groot":
-        from lerobot.policies.diffusion_sparsh.groot.modeling_groot import GrootPolicy
+        from lerobot.policies.groot.modeling_groot import GrootPolicy
 
         return GrootPolicy
     elif name == "xvla":
@@ -428,7 +427,7 @@ def make_pre_post_processors(
             dataset_meta=kwargs.get("dataset_meta"),
         )
     elif isinstance(policy_cfg, GrootConfig):
-        from lerobot.policies.diffusion_sparsh.groot.processor_groot import make_groot_pre_post_processors
+        from lerobot.policies.groot.processor_groot import make_groot_pre_post_processors
 
         processors = make_groot_pre_post_processors(
             config=policy_cfg,

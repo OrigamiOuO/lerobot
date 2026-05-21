@@ -215,6 +215,31 @@ class DiffusionSparshConfig(PreTrainedConfig):
     modality_projection_dim: int | None = 128
     project_state_condition: bool = False
 
+    # === Optional attention-based multi-modal fusion ===
+    # By default this is fully disabled, so the policy keeps the original concat baseline.
+    # If `attention_fusion_type` is set to a value other than "none", attention is enabled
+    # even when `use_attention_fusion` is left as False. This makes CLI ablations shorter.
+    use_attention_fusion: bool = False
+    attention_fusion_type: str = "none"  # one of ["none", "self_attention", "cross_v2t", "cross_t2v", "bidirectional_cross"]
+    # Which modality tokens participate in attention. Other enabled modalities are
+    # still concatenated into global_cond when attention_keep_original_modalities=False.
+    # Default implements wrist-guided tactile cross-attention:
+    # Q = wrist_rgb, K/V = tactile_raw + tactile_marker.
+    attention_query_modalities: tuple[str, ...] = ("wrist_rgb",)
+    attention_key_value_modalities: tuple[str, ...] = ("tactile_raw", "tactile_marker")
+    attention_d_model: int = 128
+    attention_nhead: int = 4
+    attention_num_layers: int = 1
+    attention_dim_feedforward: int = 512
+    attention_dropout: float = 0.1
+    attention_use_gated_residual: bool = True
+    # False: attention replaces only the selected attention-source modalities;
+    #        unattended enabled modalities remain ordinary concat features.
+    # True:  original concat features are kept and attention_fused is appended.
+    attention_keep_original_modalities: bool = False
+    attention_debug_inference: bool = True
+    attention_debug_every_n_calls: int = 5
+
     # === Optional multi-modal consensus MoE ===
     use_modal_moe: bool = False
     moe_num_experts: int = 2
@@ -373,6 +398,72 @@ class DiffusionSparshConfig(PreTrainedConfig):
                 "`modality_projection_dim` must be None or a positive integer. "
                 f"Got {self.modality_projection_dim}."
             )
+
+        supported_attention_types = ["none", "self_attention", "cross_v2t", "cross_t2v", "bidirectional_cross"]
+        if self.attention_fusion_type not in supported_attention_types:
+            raise ValueError(
+                "`attention_fusion_type` must be one of "
+                f"{supported_attention_types}. Got {self.attention_fusion_type}."
+            )
+
+        if self.use_attention_fusion and self.attention_fusion_type == "none":
+            raise ValueError(
+                "`use_attention_fusion=True` requires `attention_fusion_type` to be set to "
+                "one of ['self_attention', 'cross_v2t', 'cross_t2v', 'bidirectional_cross']."
+            )
+
+        attention_is_enabled = self.use_attention_fusion or self.attention_fusion_type != "none"
+        if attention_is_enabled:
+            if self.attention_d_model < 1:
+                raise ValueError(f"`attention_d_model` must be >= 1. Got {self.attention_d_model}.")
+            if self.attention_nhead < 1:
+                raise ValueError(f"`attention_nhead` must be >= 1. Got {self.attention_nhead}.")
+            if self.attention_d_model % self.attention_nhead != 0:
+                raise ValueError(
+                    "`attention_d_model` must be divisible by `attention_nhead`. "
+                    f"Got {self.attention_d_model=} and {self.attention_nhead=}."
+                )
+            if self.attention_num_layers < 1:
+                raise ValueError(
+                    f"`attention_num_layers` must be >= 1. Got {self.attention_num_layers}."
+                )
+            if self.attention_dim_feedforward < 1:
+                raise ValueError(
+                    "`attention_dim_feedforward` must be >= 1. "
+                    f"Got {self.attention_dim_feedforward}."
+                )
+            supported_attention_modalities = {
+                "global_rgb",
+                "wrist_rgb",
+                "rgb",
+                "tactile_raw",
+                "tactile_fused",
+                "tactile_marker",
+            }
+            query_modalities = tuple(self.attention_query_modalities)
+            key_value_modalities = tuple(self.attention_key_value_modalities)
+            if len(query_modalities) == 0:
+                raise ValueError("`attention_query_modalities` must contain at least one modality.")
+            if self.attention_fusion_type != "self_attention" and len(key_value_modalities) == 0:
+                raise ValueError("Cross-attention requires `attention_key_value_modalities` to be non-empty.")
+            unknown_modalities = (set(query_modalities) | set(key_value_modalities)) - supported_attention_modalities
+            if unknown_modalities:
+                raise ValueError(
+                    "Unsupported attention modality names: "
+                    f"{sorted(unknown_modalities)}. Supported values are {sorted(supported_attention_modalities)}."
+                )
+            if not (0.0 <= self.attention_dropout < 1.0):
+                raise ValueError(f"`attention_dropout` must be in [0, 1). Got {self.attention_dropout}.")
+            if self.use_modal_moe:
+                raise ValueError(
+                    "`use_modal_moe` and attention fusion are alternative feature-fusion branches. "
+                    "Please enable only one of them in a single run."
+                )
+            if self.attention_debug_every_n_calls < 1:
+                raise ValueError(
+                    "`attention_debug_every_n_calls` must be >= 1. "
+                    f"Got {self.attention_debug_every_n_calls}."
+                )
 
         if self.use_modal_moe:
             if self.moe_num_experts < 1:

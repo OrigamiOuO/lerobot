@@ -556,6 +556,278 @@ class MultiModalConsensusMoE(nn.Module):
         return self.out_norm(consensus)
 
 
+class CrossModalAttentionFusion(nn.Module):
+    """Attention-based feature fusion over projected observation modality tokens.
+
+    The module consumes `modality_features` with tensors of shape (B, S, D_i),
+    projects selected vision/tactile modalities to a common attention dimension,
+    and returns one fused feature per observation step with shape (B, S, D_attn).
+
+    Supported fusion types:
+    - self_attention: Q=K=V over [vision, tactile] modality tokens.
+    - cross_v2t: Q=vision, K/V=tactile.
+    - cross_t2v: Q=tactile, K/V=vision.
+    - bidirectional_cross: both vision->tactile and tactile->vision, then merge.
+    """
+
+    def __init__(
+        self,
+        modality_input_dims: dict[str, int],
+        fusion_type: str,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        dim_feedforward: int,
+        dropout: float,
+        query_names: tuple[str, ...] = ("wrist_rgb",),
+        key_value_names: tuple[str, ...] = ("tactile_raw", "tactile_marker"),
+        use_gated_residual: bool = True,
+        debug_inference: bool = False,
+        debug_every_n_calls: int = 1,
+    ):
+        super().__init__()
+        self.fusion_type = fusion_type
+        self.d_model = d_model
+        self.use_gated_residual = use_gated_residual
+        self.debug_inference = debug_inference
+        self.debug_every_n_calls = debug_every_n_calls
+        self._inference_call_count = 0
+        self.last_attention_debug: dict[str, float | list[str] | int] | None = None
+
+        available_names = set(modality_input_dims)
+        self.query_names = tuple(name for name in query_names if name in available_names)
+        self.key_value_names = tuple(name for name in key_value_names if name in available_names)
+        self.attended_names = tuple(dict.fromkeys((*self.query_names, *self.key_value_names)))
+
+        if fusion_type == "self_attention":
+            if len(self.attended_names) < 2:
+                raise ValueError(
+                    "`self_attention` requires at least two selected modality tokens. "
+                    f"Got attended={self.attended_names}. Available={tuple(modality_input_dims)}."
+                )
+        elif fusion_type in {"cross_v2t", "cross_t2v", "bidirectional_cross"}:
+            if len(self.query_names) == 0 or len(self.key_value_names) == 0:
+                raise ValueError(
+                    f"`{fusion_type}` requires at least one query modality and one key/value modality. "
+                    f"Got query={self.query_names}, key_value={self.key_value_names}. "
+                    f"Available={tuple(modality_input_dims)}."
+                )
+        else:
+            raise ValueError(f"Unsupported attention fusion type {fusion_type}.")
+
+        self.input_projectors = nn.ModuleDict(
+            {
+                name: (_make_mlp_projection(in_dim, d_model) if in_dim != d_model else nn.Identity())
+                for name, in_dim in modality_input_dims.items()
+                if name in self.attended_names
+            }
+        )
+        self.modality_embed = nn.ParameterDict(
+            {name: nn.Parameter(torch.zeros(1, 1, d_model)) for name in self.attended_names}
+        )
+
+        if fusion_type == "self_attention":
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True,
+                norm_first=True,
+            )
+            self.self_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+            self.out_norm = nn.LayerNorm(d_model)
+        else:
+            self.norm_q_v2t = nn.LayerNorm(d_model)
+            self.norm_kv_v2t = nn.LayerNorm(d_model)
+            self.cross_attn_v2t = nn.MultiheadAttention(
+                embed_dim=d_model,
+                num_heads=nhead,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.ffn_v2t = nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, dim_feedforward),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(dim_feedforward, d_model),
+            )
+            self.gate_v2t = nn.Parameter(torch.zeros(1))
+            self.ffn_gate_v2t = nn.Parameter(torch.zeros(1))
+
+            self.norm_q_t2v = nn.LayerNorm(d_model)
+            self.norm_kv_t2v = nn.LayerNorm(d_model)
+            self.cross_attn_t2v = nn.MultiheadAttention(
+                embed_dim=d_model,
+                num_heads=nhead,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.ffn_t2v = nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, dim_feedforward),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(dim_feedforward, d_model),
+            )
+            self.gate_t2v = nn.Parameter(torch.zeros(1))
+            self.ffn_gate_t2v = nn.Parameter(torch.zeros(1))
+
+            self.bidirectional_merge = nn.Sequential(
+                nn.LayerNorm(2 * d_model),
+                nn.Linear(2 * d_model, d_model),
+                nn.GELU(),
+                nn.LayerNorm(d_model),
+            )
+            self.out_norm = nn.LayerNorm(d_model)
+
+    def _stack_tokens(self, modality_features: dict[str, Tensor], names: tuple[str, ...]) -> Tensor:
+        """Project selected modality features and stack them into (B*S, M, D)."""
+        tokens = []
+        batch_size, n_obs_steps = None, None
+        for name in names:
+            if name not in modality_features:
+                continue
+            x = self.input_projectors[name](modality_features[name])  # (B, S, D)
+            if batch_size is None:
+                batch_size, n_obs_steps = x.shape[:2]
+            x = x + self.modality_embed[name]
+            tokens.append(x.reshape(x.shape[0] * x.shape[1], 1, x.shape[2]))
+
+        if len(tokens) == 0:
+            raise ValueError(f"No valid modality tokens found for names={names}.")
+        return torch.cat(tokens, dim=1)
+
+    def _cross_block(
+        self,
+        query_tokens: Tensor,
+        kv_tokens: Tensor,
+        cross_attn: nn.MultiheadAttention,
+        norm_q: nn.LayerNorm,
+        norm_kv: nn.LayerNorm,
+        ffn: nn.Module,
+        attn_gate: Tensor,
+        ffn_gate: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Apply gated residual cross-attention and a gated FFN."""
+        attn_out, attn_weights = cross_attn(
+            query=norm_q(query_tokens),
+            key=norm_kv(kv_tokens),
+            value=norm_kv(kv_tokens),
+            need_weights=True,
+        )
+        if self.use_gated_residual:
+            query_tokens = query_tokens + torch.tanh(attn_gate) * attn_out
+            query_tokens = query_tokens + torch.tanh(ffn_gate) * ffn(query_tokens)
+        else:
+            query_tokens = query_tokens + attn_out
+            query_tokens = query_tokens + ffn(query_tokens)
+        return query_tokens, attn_weights
+
+    def _maybe_debug_attention(self, attn_weights: Tensor | None, query_names: tuple[str, ...], key_names: tuple[str, ...]) -> None:
+        if self.training or not self.debug_inference:
+            return
+        self._inference_call_count += 1
+        if attn_weights is None:
+            self.last_attention_debug = {
+                "call": self._inference_call_count,
+                "fusion_type": self.fusion_type,
+                "query_modalities": list(query_names),
+                "key_modalities": list(key_names),
+            }
+            return
+
+        # MultiheadAttention returns average attention weights with shape (B*S, Nq, Nk).
+        mean_per_key = attn_weights.detach().mean(dim=(0, 1)).cpu().tolist()
+        self.last_attention_debug = {
+            "call": self._inference_call_count,
+            "fusion_type": self.fusion_type,
+            "query_modalities": list(query_names),
+            "key_modalities": list(key_names),
+            "mean_attention_per_key": mean_per_key,
+        }
+        if self._inference_call_count % self.debug_every_n_calls == 0:
+            key_pairs = ", ".join(
+                [f"{name}:{weight:.4f}" for name, weight in zip(key_names, mean_per_key, strict=True)]
+            )
+            print(
+                f"[attention_fusion] call={self._inference_call_count} type={self.fusion_type} "
+                f"query={list(query_names)} keys={key_pairs}"
+            )
+
+    def forward(self, modality_features: dict[str, Tensor]) -> Tensor:
+        """Return fused attention feature with shape (B, S, d_model)."""
+        reference = next(iter(modality_features.values()))
+        batch_size, n_obs_steps = reference.shape[:2]
+
+        if self.fusion_type == "self_attention":
+            tokens = self._stack_tokens(modality_features, self.attended_names)
+            attended = self.self_encoder(tokens)
+            fused = attended.mean(dim=1)
+            self._maybe_debug_attention(None, self.attended_names, self.attended_names)
+            return self.out_norm(fused).reshape(batch_size, n_obs_steps, self.d_model)
+
+        query_tokens = self._stack_tokens(modality_features, self.query_names)
+        key_value_tokens = self._stack_tokens(modality_features, self.key_value_names)
+
+        if self.fusion_type == "cross_v2t":
+            query_attended, attn_weights = self._cross_block(
+                query_tokens,
+                key_value_tokens,
+                self.cross_attn_v2t,
+                self.norm_q_v2t,
+                self.norm_kv_v2t,
+                self.ffn_v2t,
+                self.gate_v2t,
+                self.ffn_gate_v2t,
+            )
+            self._maybe_debug_attention(attn_weights, self.query_names, self.key_value_names)
+            fused = query_attended.mean(dim=1)
+        elif self.fusion_type == "cross_t2v":
+            key_value_attended, attn_weights = self._cross_block(
+                key_value_tokens,
+                query_tokens,
+                self.cross_attn_t2v,
+                self.norm_q_t2v,
+                self.norm_kv_t2v,
+                self.ffn_t2v,
+                self.gate_t2v,
+                self.ffn_gate_t2v,
+            )
+            self._maybe_debug_attention(attn_weights, self.key_value_names, self.query_names)
+            fused = key_value_attended.mean(dim=1)
+        elif self.fusion_type == "bidirectional_cross":
+            query_attended, attn_weights_q2kv = self._cross_block(
+                query_tokens,
+                key_value_tokens,
+                self.cross_attn_v2t,
+                self.norm_q_v2t,
+                self.norm_kv_v2t,
+                self.ffn_v2t,
+                self.gate_v2t,
+                self.ffn_gate_v2t,
+            )
+            key_value_attended, _ = self._cross_block(
+                key_value_tokens,
+                query_tokens,
+                self.cross_attn_t2v,
+                self.norm_q_t2v,
+                self.norm_kv_t2v,
+                self.ffn_t2v,
+                self.gate_t2v,
+                self.ffn_gate_t2v,
+            )
+            self._maybe_debug_attention(attn_weights_q2kv, self.query_names, self.key_value_names)
+            fused = self.bidirectional_merge(
+                torch.cat([query_attended.mean(dim=1), key_value_attended.mean(dim=1)], dim=-1)
+            )
+        else:
+            raise ValueError(f"Unsupported attention fusion type {self.fusion_type}.")
+
+        return self.out_norm(fused).reshape(batch_size, n_obs_steps, self.d_model)
+
+
 class DiffusionSparshModel(nn.Module):
     """Core diffusion model with tactile sensor support.
 
@@ -585,6 +857,14 @@ class DiffusionSparshModel(nn.Module):
         self.modality_projection_dim: int | None = getattr(config, "modality_projection_dim", None)
         self.project_state: bool = bool(getattr(config, "project_state_condition", False))
         self.modality_projectors = nn.ModuleDict()
+        self.use_attention_fusion = bool(
+            getattr(config, "use_attention_fusion", False)
+            or getattr(config, "attention_fusion_type", "none") != "none"
+        )
+        self.attention_fusion_type = getattr(config, "attention_fusion_type", "none")
+        self.attention_keep_original_modalities = bool(
+            getattr(config, "attention_keep_original_modalities", False)
+        )
 
         # Keep tactile raw/depth/normal out of the RGB branch when they are stored
         # as video/image features.
@@ -602,6 +882,12 @@ class DiffusionSparshModel(nn.Module):
         ) if len(self._tactile_depth_keys) > 0 else []
 
         self._rgb_image_keys = list(self.config.enabled_rgb_image_features.keys())
+        global_rgb_keys = set(self.config.global_rgb_features.keys())
+        wrist_rgb_keys = set(self.config.wrist_rgb_features.keys())
+        self._global_rgb_image_keys = [key for key in self._rgb_image_keys if key in global_rgb_keys]
+        self._wrist_rgb_image_keys = [key for key in self._rgb_image_keys if key in wrist_rgb_keys]
+        self._global_rgb_indices = [idx for idx, key in enumerate(self._rgb_image_keys) if key in global_rgb_keys]
+        self._wrist_rgb_indices = [idx for idx, key in enumerate(self._rgb_image_keys) if key in wrist_rgb_keys]
 
         # ------------------------------------------------------------------
         # Observation encoders and modality dimensions.
@@ -631,12 +917,24 @@ class DiffusionSparshModel(nn.Module):
                 self.rgb_encoder = nn.ModuleList(
                     [DiffusionRgbEncoder(config, image_shape=self.config.enabled_rgb_image_features[key].shape) for key in self._rgb_image_keys]
                 )
-                rgb_raw_dim = self.rgb_encoder[0].feature_dim * len(self._rgb_image_keys)
+                self._rgb_raw_feature_dim_per_camera = self.rgb_encoder[0].feature_dim
             else:
                 first_shape = self.config.enabled_rgb_image_features[self._rgb_image_keys[0]].shape
                 self.rgb_encoder = DiffusionRgbEncoder(config, image_shape=first_shape)
-                rgb_raw_dim = self.rgb_encoder.feature_dim * len(self._rgb_image_keys)
-            global_cond_dim += register_modality("rgb", rgb_raw_dim)
+                self._rgb_raw_feature_dim_per_camera = self.rgb_encoder.feature_dim
+
+            if self.use_attention_fusion:
+                # Split RGB into semantically separate tokens so attention can use
+                # wrist_rgb while global_rgb remains a simple concat feature.
+                if len(self._global_rgb_indices) > 0:
+                    global_rgb_raw_dim = self._rgb_raw_feature_dim_per_camera * len(self._global_rgb_indices)
+                    global_cond_dim += register_modality("global_rgb", global_rgb_raw_dim)
+                if len(self._wrist_rgb_indices) > 0:
+                    wrist_rgb_raw_dim = self._rgb_raw_feature_dim_per_camera * len(self._wrist_rgb_indices)
+                    global_cond_dim += register_modality("wrist_rgb", wrist_rgb_raw_dim)
+            else:
+                rgb_raw_dim = self._rgb_raw_feature_dim_per_camera * len(self._rgb_image_keys)
+                global_cond_dim += register_modality("rgb", rgb_raw_dim)
 
         if self.config.env_state_feature:
             global_cond_dim += register_modality("env_state", self.config.env_state_feature.shape[0])
@@ -683,6 +981,40 @@ class DiffusionSparshModel(nn.Module):
             global_cond_dim += config.moe_hidden_dim
         else:
             self.modal_moe = None
+
+        # Optional attention-based feature fusion. This is inserted after all
+        # modality encoders/projections and before flattening into global_cond.
+        if self.use_attention_fusion:
+            self.attention_fusion = CrossModalAttentionFusion(
+                modality_input_dims=self._modality_dims,
+                fusion_type=self.attention_fusion_type,
+                d_model=config.attention_d_model,
+                nhead=config.attention_nhead,
+                num_layers=config.attention_num_layers,
+                dim_feedforward=config.attention_dim_feedforward,
+                dropout=config.attention_dropout,
+                query_names=getattr(config, "attention_query_modalities", ("wrist_rgb",)),
+                key_value_names=getattr(config, "attention_key_value_modalities", ("tactile_raw", "tactile_marker")),
+                use_gated_residual=config.attention_use_gated_residual,
+                debug_inference=config.attention_debug_inference,
+                debug_every_n_calls=config.attention_debug_every_n_calls,
+            )
+            self._attention_source_modalities = set(self.attention_fusion.attended_names)
+            if self.attention_keep_original_modalities:
+                # Original concat features are kept; attention feature is appended.
+                global_cond_dim += config.attention_d_model
+            else:
+                # Replace only the modalities participating in attention.
+                # Unattended enabled modalities, e.g. global_rgb or tactile_fused,
+                # remain ordinary concatenated conditioning features.
+                global_cond_dim = sum(
+                    dim
+                    for name, dim in self._modality_dims.items()
+                    if name not in self._attention_source_modalities
+                ) + config.attention_d_model
+        else:
+            self.attention_fusion = None
+            self._attention_source_modalities = set()
 
         # ------------------------------------------------------------------
         # Denoiser backbone: single denoiser or semantic denoiser MoE.
@@ -770,7 +1102,7 @@ class DiffusionSparshModel(nn.Module):
             return {name: [name] for name in non_state_modalities}
 
         if self.denoiser_grouping_strategy == "semantic":
-            visual = [name for name in non_state_modalities if name == "rgb"]
+            visual = [name for name in non_state_modalities if name in {"rgb", "global_rgb", "wrist_rgb"}]
             tactile = [name for name in non_state_modalities if name.startswith("tactile")]
             other = [name for name in non_state_modalities if name not in visual and name not in tactile]
 
@@ -970,18 +1302,38 @@ class DiffusionSparshModel(nn.Module):
                     encoder(images)
                     for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
                 ]
-                img_features_cat = torch.cat(img_features_list, dim=0)
-                img_features = einops.rearrange(
-                    img_features_cat, "(n b s) d -> b s (n d)", b=batch_size, s=n_obs_steps, n=len(self._rgb_image_keys)
+                img_features_per_camera = torch.stack(img_features_list, dim=1)  # (B*S, N, D)
+                img_features_per_camera = einops.rearrange(
+                    img_features_per_camera, "(b s) n d -> b s n d", b=batch_size, s=n_obs_steps
                 )
             else:
-                img_features = self.rgb_encoder(einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ..."))
-                img_features = einops.rearrange(
-                    img_features, "(b s n) d -> b s (n d)", b=batch_size, s=n_obs_steps, n=len(self._rgb_image_keys)
+                img_features_per_camera = self.rgb_encoder(
+                    einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
                 )
-            img_features = self._project_modality("rgb", img_features)
-            global_cond_feats.append(img_features)
-            modality_features["rgb"] = img_features
+                img_features_per_camera = einops.rearrange(
+                    img_features_per_camera,
+                    "(b s n) d -> b s n d",
+                    b=batch_size,
+                    s=n_obs_steps,
+                    n=len(self._rgb_image_keys),
+                )
+
+            if self.use_attention_fusion:
+                if len(self._global_rgb_indices) > 0:
+                    global_rgb_features = img_features_per_camera[:, :, self._global_rgb_indices, :].flatten(start_dim=2)
+                    global_rgb_features = self._project_modality("global_rgb", global_rgb_features)
+                    global_cond_feats.append(global_rgb_features)
+                    modality_features["global_rgb"] = global_rgb_features
+                if len(self._wrist_rgb_indices) > 0:
+                    wrist_rgb_features = img_features_per_camera[:, :, self._wrist_rgb_indices, :].flatten(start_dim=2)
+                    wrist_rgb_features = self._project_modality("wrist_rgb", wrist_rgb_features)
+                    global_cond_feats.append(wrist_rgb_features)
+                    modality_features["wrist_rgb"] = wrist_rgb_features
+            else:
+                img_features = img_features_per_camera.flatten(start_dim=2)
+                img_features = self._project_modality("rgb", img_features)
+                global_cond_feats.append(img_features)
+                modality_features["rgb"] = img_features
 
         if self.config.env_state_feature:
             env_features = self._project_modality("env_state", batch[OBS_ENV_STATE])
@@ -1037,6 +1389,21 @@ class DiffusionSparshModel(nn.Module):
         if self.modal_moe is not None:
             consensus_features = self.modal_moe(modality_features)
             global_cond_feats.append(consensus_features)
+
+        if self.attention_fusion is not None:
+            attention_features = self.attention_fusion(modality_features)
+            if self.attention_keep_original_modalities:
+                # Keep the original concat condition and append the attention feature.
+                global_cond_feats.append(attention_features)
+            else:
+                # Replace only the selected attention-source modalities.
+                # Other enabled modalities, e.g. global_rgb, stay as simple concat.
+                global_cond_feats = [
+                    modality_features[name]
+                    for name in self._modality_dims
+                    if name in modality_features and name not in self._attention_source_modalities
+                ]
+                global_cond_feats.append(attention_features)
 
         global_cond = torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
 
