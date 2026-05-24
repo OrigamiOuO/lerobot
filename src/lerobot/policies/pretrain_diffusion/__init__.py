@@ -17,15 +17,11 @@
 from lerobot.policies.pretrain_diffusion.configuration_pretrain_diffusion import (
     PretrainDiffusionConfig,
 )
-from lerobot.policies.pretrain_diffusion.modeling_pretrain_diffusion import (
-    PretrainDiffusionPolicy,
-)
 from lerobot.policies.pretrain_diffusion.processor_pretrain_diffusion import (
     make_pretrain_diffusion_pre_post_processors,
 )
 
 __all__ = [
     "PretrainDiffusionConfig",
-    "PretrainDiffusionPolicy",
     "make_pretrain_diffusion_pre_post_processors",
 ]

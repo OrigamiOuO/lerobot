@@ -1,0 +1,210 @@
+nohup: 忽略输入
+WARNING:lerobot.configs.policies:Device 'None' is not available. Switching to 'cuda'.
+INFO 2026-05-24 17:24:46 ot_train.py:196 {'batch_size': 512,
+ 'checkpoint_path': None,
+ 'dataloader_persistent_workers': True,
+ 'dataloader_prefetch_factor': 2,
+ 'dataset': {'episodes': None,
+             'image_transforms': {'enable': False,
+                                  'max_num_transforms': 3,
+                                  'random_order': False,
+                                  'tfs': {'affine': {'kwargs': {'degrees': [-5.0,
+                                                                            5.0],
+                                                                'translate': [0.05,
+                                                                              0.05]},
+                                                     'type': 'RandomAffine',
+                                                     'weight': 1.0},
+                                          'brightness': {'kwargs': {'brightness': [0.8,
+                                                                                   1.2]},
+                                                         'type': 'ColorJitter',
+                                                         'weight': 1.0},
+                                          'contrast': {'kwargs': {'contrast': [0.8,
+                                                                               1.2]},
+                                                       'type': 'ColorJitter',
+                                                       'weight': 1.0},
+                                          'hue': {'kwargs': {'hue': [-0.05,
+                                                                     0.05]},
+                                                  'type': 'ColorJitter',
+                                                  'weight': 1.0},
+                                          'saturation': {'kwargs': {'saturation': [0.5,
+                                                                                   1.5]},
+                                                         'type': 'ColorJitter',
+                                                         'weight': 1.0},
+                                          'sharpness': {'kwargs': {'sharpness': [0.5,
+                                                                                 1.5]},
+                                                        'type': 'SharpnessJitter',
+                                                        'weight': 1.0}}},
+             'preload_to_memory': True,
+             'repo_id': 'grasp_multi_10',
+             'revision': None,
+             'root': 'datasets/luo_proj/Blind_Grasping_LeRobot_No_HandPC',
+             'streaming': False,
+             'use_imagenet_stats': True,
+             'video_backend': 'torchcodec'},
+ 'env': None,
+ 'eval': {'batch_size': 50, 'n_episodes': 50, 'use_async_envs': False},
+ 'eval_freq': 20000,
+ 'filter_unused_dataset_columns': True,
+ 'job_name': 'mlp_128_60000steps',
+ 'log_freq': 1000,
+ 'num_workers': 4,
+ 'optimizer': {'betas': [0.95, 0.999],
+               'eps': 1e-08,
+               'grad_clip_norm': 10.0,
+               'lr': 0.0001,
+               'type': 'adam',
+               'weight_decay': 1e-06},
+ 'output_dir': 'checkpoints/luo_proj/pretrain_mlp_128',
+ 'peft': None,
+ 'policy': {'ablation_mode': 'full',
+            'action_dim': 8,
+            'cube_pos_feature_key': 'cube_pos',
+            'device': 'cuda',
+            'do_mask_loss_for_padding': False,
+            'drop_n_last_frames': 7,
+            'freeze_pretrained_encoder': True,
+            'fsr_dim': 12,
+            'fsr_feature_key': 'observation.fsr',
+            'hand_pc_feature_key': 'observation.hand_pc',
+            'horizon': 8,
+            'input_features': {},
+            'license': None,
+            'mlp_activation': 'relu',
+            'mlp_hidden_dims': [128],
+            'n_action_steps': 3,
+            'n_obs_steps': 5,
+            'normalization_mapping': {'ACTION': <NormalizationMode.MIN_MAX: 'MIN_MAX'>,
+                                      'STATE': <NormalizationMode.MIN_MAX: 'MIN_MAX'>},
+            'optimizer_betas': [0.95, 0.999],
+            'optimizer_eps': 1e-08,
+            'optimizer_lr': 0.0001,
+            'optimizer_weight_decay': 1e-06,
+            'output_features': {},
+            'pretrained_encoder_ckpt_path': 'src/lerobot/policies/pretrain_diffusion/pretrain_encoder_v2/latest_geometry_ckpt.pth',
+            'pretrained_encoder_embed_dim': 384,
+            'pretrained_encoder_max_seq_len': 16,
+            'pretrained_path': None,
+            'private': None,
+            'push_to_hub': False,
+            'repo_id': 'pretrain_mlp_128',
+            'scheduler_name': 'cosine',
+            'scheduler_warmup_steps': 2000,
+            'sparse_pc_feature_key': 'observation.sparse_pc',
+            'sparse_pc_num_points': 44,
+            'sparse_pc_point_dim': 4,
+            'state_feature_key': 'observation.state',
+            'state_fused_input_dim': 88,
+            'state_mlp_hidden_dim1': 128,
+            'state_mlp_hidden_dim2': 256,
+            'state_mlp_output_dim': 512,
+            'state_velocity_feature_key': 'observation.state_velocity',
+            'tactile_dim': 32,
+            'tactile_feature_key': 'observation.tactile',
+            'tags': None,
+            'type': 'pretrain_mlp',
+            'use_amp': True,
+            'use_peft': False},
+ 'rabc_epsilon': 1e-06,
+ 'rabc_head_mode': 'sparse',
+ 'rabc_kappa': 0.01,
+ 'rabc_progress_path': None,
+ 'rename_map': {},
+ 'resume': False,
+ 'save_checkpoint': True,
+ 'save_freq': 10000,
+ 'scheduler': None,
+ 'seed': 1000,
+ 'steps': 60000,
+ 'tolerance_s': 0.0001,
+ 'use_policy_training_preset': True,
+ 'use_rabc': False,
+ 'wandb': {'disable_artifact': False,
+           'enable': False,
+           'entity': None,
+           'mode': None,
+           'notes': None,
+           'project': 'lerobot',
+           'run_id': None}}
+INFO 2026-05-24 17:24:46 ot_train.py:204 Logs will be saved locally.
+INFO 2026-05-24 17:24:46 ot_train.py:216 Creating dataset
+INFO 2026-05-24 17:24:48 ot_train.py:229 Preloading dataset into CPU RAM (dataset.preload_to_memory=True)
+INFO 2026-05-24 17:24:48 y_dataset.py:77 Preloading 1380576 frames into CPU memory (bulk column read)...
+Preloading columns to RAM:   0%|          | 0/11 [00:00<?, ?it/s]Preloading columns to RAM:   9%|▉         | 1/11 [01:56<19:25, 116.57s/it]Preloading columns to RAM:  18%|█▊        | 2/11 [03:57<17:51, 119.08s/it]Preloading columns to RAM:  27%|██▋       | 3/11 [05:55<15:48, 118.59s/it]Preloading columns to RAM:  36%|███▋      | 4/11 [07:55<13:53, 119.07s/it]Preloading columns to RAM:  45%|████▌     | 5/11 [09:52<11:51, 118.60s/it]Preloading columns to RAM:  55%|█████▍    | 6/11 [16:01<16:57, 203.42s/it]Preloading columns to RAM:  64%|██████▎   | 7/11 [17:44<11:23, 170.75s/it]Preloading columns to RAM:  73%|███████▎  | 8/11 [19:33<07:32, 150.95s/it]Preloading columns to RAM:  82%|████████▏ | 9/11 [21:20<04:34, 137.28s/it]Preloading columns to RAM:  91%|█████████ | 10/11 [23:09<02:08, 128.60s/it]Preloading columns to RAM: 100%|██████████| 11/11 [24:56<00:00, 121.86s/it]Preloading columns to RAM: 100%|██████████| 11/11 [24:56<00:00, 136.01s/it]
+INFO 2026-05-24 17:49:44 y_dataset.py:95 Dataset preloaded: 1.63 GB in CPU RAM (1380576 frames, 11 columns)
+INFO 2026-05-24 17:50:07 ot_train.py:242 Creating policy
+INFO 2026-05-24 17:50:08 ot_train.py:297 Creating optimizer and scheduler
+INFO 2026-05-24 17:50:08 ot_train.py:332 Output dir: checkpoints/luo_proj/pretrain_mlp_128
+INFO 2026-05-24 17:50:08 ot_train.py:339 cfg.steps=60000 (60K)
+INFO 2026-05-24 17:50:08 ot_train.py:340 dataset.num_frames=1380576 (1M)
+INFO 2026-05-24 17:50:08 ot_train.py:341 dataset.num_episodes=10000
+INFO 2026-05-24 17:50:08 ot_train.py:344 Effective batch size: 512 x 1 = 512
+INFO 2026-05-24 17:50:08 ot_train.py:345 num_learnable_params=313520 (314K)
+INFO 2026-05-24 17:50:08 ot_train.py:346 num_total_params=11034416 (11M)
+INFO 2026-05-24 17:50:08 ot_train.py:403 Start offline training on a fixed dataset, with effective batch size: 512
+INFO 2026-05-24 17:51:00 ot_train.py:433 step:1K smpl:512K ep:4K epch:0.37 loss:0.056 grdn:0.023 lr:1.0e-04 updt_s:0.012 data_s:0.041
+INFO 2026-05-24 17:51:49 ot_train.py:433 step:2K smpl:1M ep:7K epch:0.74 loss:0.044 grdn:0.025 lr:1.0e-04 updt_s:0.011 data_s:0.038
+INFO 2026-05-24 17:52:41 ot_train.py:433 step:3K smpl:2M ep:11K epch:1.11 loss:0.041 grdn:0.028 lr:1.0e-04 updt_s:0.011 data_s:0.042
+INFO 2026-05-24 17:53:32 ot_train.py:433 step:4K smpl:2M ep:15K epch:1.48 loss:0.040 grdn:0.028 lr:1.0e-04 updt_s:0.011 data_s:0.039
+INFO 2026-05-24 17:54:22 ot_train.py:433 step:5K smpl:3M ep:19K epch:1.85 loss:0.038 grdn:0.030 lr:1.0e-04 updt_s:0.011 data_s:0.039
+INFO 2026-05-24 17:55:15 ot_train.py:433 step:6K smpl:3M ep:22K epch:2.23 loss:0.037 grdn:0.031 lr:1.0e-04 updt_s:0.011 data_s:0.042
+INFO 2026-05-24 17:56:06 ot_train.py:433 step:7K smpl:4M ep:26K epch:2.60 loss:0.037 grdn:0.031 lr:1.0e-04 updt_s:0.011 data_s:0.040
+INFO 2026-05-24 17:56:59 ot_train.py:433 step:8K smpl:4M ep:30K epch:2.97 loss:0.036 grdn:0.032 lr:1.0e-04 updt_s:0.011 data_s:0.042
+INFO 2026-05-24 17:57:57 ot_train.py:433 step:9K smpl:5M ep:33K epch:3.34 loss:0.036 grdn:0.033 lr:1.0e-04 updt_s:0.013 data_s:0.045
+INFO 2026-05-24 17:58:49 ot_train.py:433 step:10K smpl:5M ep:37K epch:3.71 loss:0.035 grdn:0.033 lr:1.0e-04 updt_s:0.013 data_s:0.040
+INFO 2026-05-24 17:58:49 ot_train.py:453 Checkpoint policy after step 10000
+INFO 2026-05-24 17:59:45 ot_train.py:433 step:11K smpl:6M ep:41K epch:4.08 loss:0.035 grdn:0.034 lr:1.0e-04 updt_s:0.013 data_s:0.043
+INFO 2026-05-24 18:00:41 ot_train.py:433 step:12K smpl:6M ep:45K epch:4.45 loss:0.034 grdn:0.035 lr:1.0e-04 updt_s:0.012 data_s:0.044
+INFO 2026-05-24 18:01:37 ot_train.py:433 step:13K smpl:7M ep:48K epch:4.82 loss:0.034 grdn:0.035 lr:1.0e-04 updt_s:0.013 data_s:0.043
+INFO 2026-05-24 18:02:30 ot_train.py:433 step:14K smpl:7M ep:52K epch:5.19 loss:0.034 grdn:0.035 lr:1.0e-04 updt_s:0.013 data_s:0.040
+INFO 2026-05-24 18:03:21 ot_train.py:433 step:15K smpl:8M ep:56K epch:5.56 loss:0.033 grdn:0.037 lr:1.0e-04 updt_s:0.012 data_s:0.039
+INFO 2026-05-24 18:04:23 ot_train.py:433 step:16K smpl:8M ep:59K epch:5.93 loss:0.033 grdn:0.037 lr:1.0e-04 updt_s:0.013 data_s:0.049
+INFO 2026-05-24 18:05:16 ot_train.py:433 step:17K smpl:9M ep:63K epch:6.30 loss:0.033 grdn:0.036 lr:1.0e-04 updt_s:0.013 data_s:0.040
+INFO 2026-05-24 18:06:12 ot_train.py:433 step:18K smpl:9M ep:67K epch:6.68 loss:0.033 grdn:0.038 lr:1.0e-04 updt_s:0.013 data_s:0.043
+INFO 2026-05-24 18:07:02 ot_train.py:433 step:19K smpl:10M ep:70K epch:7.05 loss:0.032 grdn:0.037 lr:1.0e-04 updt_s:0.011 data_s:0.039
+INFO 2026-05-24 18:07:52 ot_train.py:433 step:20K smpl:10M ep:74K epch:7.42 loss:0.032 grdn:0.038 lr:1.0e-04 updt_s:0.011 data_s:0.039
+INFO 2026-05-24 18:07:52 ot_train.py:453 Checkpoint policy after step 20000
+INFO 2026-05-24 18:08:47 ot_train.py:433 step:21K smpl:11M ep:78K epch:7.79 loss:0.032 grdn:0.039 lr:1.0e-04 updt_s:0.011 data_s:0.043
+INFO 2026-05-24 18:09:37 ot_train.py:433 step:22K smpl:11M ep:82K epch:8.16 loss:0.032 grdn:0.040 lr:1.0e-04 updt_s:0.011 data_s:0.039
+INFO 2026-05-24 18:10:27 ot_train.py:433 step:23K smpl:12M ep:85K epch:8.53 loss:0.032 grdn:0.038 lr:1.0e-04 updt_s:0.011 data_s:0.039
+INFO 2026-05-24 18:11:20 ot_train.py:433 step:24K smpl:12M ep:89K epch:8.90 loss:0.032 grdn:0.040 lr:1.0e-04 updt_s:0.011 data_s:0.042
+INFO 2026-05-24 18:12:11 ot_train.py:433 step:25K smpl:13M ep:93K epch:9.27 loss:0.031 grdn:0.040 lr:1.0e-04 updt_s:0.011 data_s:0.040
+INFO 2026-05-24 18:13:05 ot_train.py:433 step:26K smpl:13M ep:96K epch:9.64 loss:0.031 grdn:0.040 lr:1.0e-04 updt_s:0.011 data_s:0.043
+INFO 2026-05-24 18:13:56 ot_train.py:433 step:27K smpl:14M ep:100K epch:10.01 loss:0.031 grdn:0.040 lr:1.0e-04 updt_s:0.011 data_s:0.039
+INFO 2026-05-24 18:14:45 ot_train.py:433 step:28K smpl:14M ep:104K epch:10.38 loss:0.031 grdn:0.040 lr:1.0e-04 updt_s:0.011 data_s:0.039
+INFO 2026-05-24 18:15:36 ot_train.py:433 step:29K smpl:15M ep:108K epch:10.75 loss:0.031 grdn:0.041 lr:1.0e-04 updt_s:0.011 data_s:0.040
+INFO 2026-05-24 18:16:24 ot_train.py:433 step:30K smpl:15M ep:111K epch:11.13 loss:0.031 grdn:0.041 lr:1.0e-04 updt_s:0.011 data_s:0.037
+INFO 2026-05-24 18:16:24 ot_train.py:453 Checkpoint policy after step 30000
+INFO 2026-05-24 18:17:15 ot_train.py:433 step:31K smpl:16M ep:115K epch:11.50 loss:0.031 grdn:0.041 lr:1.0e-04 updt_s:0.011 data_s:0.039
+INFO 2026-05-24 18:18:03 ot_train.py:433 step:32K smpl:16M ep:119K epch:11.87 loss:0.031 grdn:0.043 lr:1.0e-04 updt_s:0.011 data_s:0.036
+INFO 2026-05-24 18:18:50 ot_train.py:433 step:33K smpl:17M ep:122K epch:12.24 loss:0.031 grdn:0.040 lr:1.0e-04 updt_s:0.011 data_s:0.037
+INFO 2026-05-24 18:19:41 ot_train.py:433 step:34K smpl:17M ep:126K epch:12.61 loss:0.031 grdn:0.041 lr:1.0e-04 updt_s:0.011 data_s:0.040
+INFO 2026-05-24 18:20:29 ot_train.py:433 step:35K smpl:18M ep:130K epch:12.98 loss:0.030 grdn:0.042 lr:1.0e-04 updt_s:0.011 data_s:0.036
+INFO 2026-05-24 18:21:19 ot_train.py:433 step:36K smpl:18M ep:134K epch:13.35 loss:0.030 grdn:0.042 lr:1.0e-04 updt_s:0.011 data_s:0.040
+INFO 2026-05-24 18:22:08 ot_train.py:433 step:37K smpl:19M ep:137K epch:13.72 loss:0.030 grdn:0.042 lr:1.0e-04 updt_s:0.011 data_s:0.037
+INFO 2026-05-24 18:22:57 ot_train.py:433 step:38K smpl:19M ep:141K epch:14.09 loss:0.030 grdn:0.040 lr:1.0e-04 updt_s:0.011 data_s:0.038
+INFO 2026-05-24 18:23:49 ot_train.py:433 step:39K smpl:20M ep:145K epch:14.46 loss:0.030 grdn:0.041 lr:1.0e-04 updt_s:0.011 data_s:0.041
+INFO 2026-05-24 18:24:37 ot_train.py:433 step:40K smpl:20M ep:148K epch:14.83 loss:0.030 grdn:0.042 lr:1.0e-04 updt_s:0.011 data_s:0.037
+INFO 2026-05-24 18:24:37 ot_train.py:453 Checkpoint policy after step 40000
+INFO 2026-05-24 18:25:28 ot_train.py:433 step:41K smpl:21M ep:152K epch:15.21 loss:0.030 grdn:0.043 lr:1.0e-04 updt_s:0.011 data_s:0.040
+INFO 2026-05-24 18:26:16 ot_train.py:433 step:42K smpl:22M ep:156K epch:15.58 loss:0.030 grdn:0.042 lr:1.0e-04 updt_s:0.011 data_s:0.037
+INFO 2026-05-24 18:27:05 ot_train.py:433 step:43K smpl:22M ep:159K epch:15.95 loss:0.030 grdn:0.042 lr:1.0e-04 updt_s:0.011 data_s:0.038
+INFO 2026-05-24 18:27:58 ot_train.py:433 step:44K smpl:23M ep:163K epch:16.32 loss:0.030 grdn:0.041 lr:1.0e-04 updt_s:0.011 data_s:0.041
+INFO 2026-05-24 18:28:47 ot_train.py:433 step:45K smpl:23M ep:167K epch:16.69 loss:0.030 grdn:0.043 lr:1.0e-04 updt_s:0.011 data_s:0.039
+INFO 2026-05-24 18:29:36 ot_train.py:433 step:46K smpl:24M ep:171K epch:17.06 loss:0.030 grdn:0.041 lr:1.0e-04 updt_s:0.011 data_s:0.038
+INFO 2026-05-24 18:30:28 ot_train.py:433 step:47K smpl:24M ep:174K epch:17.43 loss:0.030 grdn:0.041 lr:1.0e-04 updt_s:0.011 data_s:0.040
+INFO 2026-05-24 18:31:16 ot_train.py:433 step:48K smpl:25M ep:178K epch:17.80 loss:0.030 grdn:0.041 lr:1.0e-04 updt_s:0.011 data_s:0.037
+INFO 2026-05-24 18:32:07 ot_train.py:433 step:49K smpl:25M ep:182K epch:18.17 loss:0.030 grdn:0.042 lr:1.0e-04 updt_s:0.011 data_s:0.040
+INFO 2026-05-24 18:32:55 ot_train.py:433 step:50K smpl:26M ep:185K epch:18.54 loss:0.030 grdn:0.041 lr:1.0e-04 updt_s:0.011 data_s:0.037
+INFO 2026-05-24 18:32:55 ot_train.py:453 Checkpoint policy after step 50000
+INFO 2026-05-24 18:33:43 ot_train.py:433 step:51K smpl:26M ep:189K epch:18.91 loss:0.029 grdn:0.043 lr:1.0e-04 updt_s:0.011 data_s:0.037
+INFO 2026-05-24 18:34:35 ot_train.py:433 step:52K smpl:27M ep:193K epch:19.28 loss:0.029 grdn:0.042 lr:1.0e-04 updt_s:0.011 data_s:0.041
+INFO 2026-05-24 18:35:23 ot_train.py:433 step:53K smpl:27M ep:197K epch:19.66 loss:0.030 grdn:0.043 lr:1.0e-04 updt_s:0.011 data_s:0.037
+INFO 2026-05-24 18:36:14 ot_train.py:433 step:54K smpl:28M ep:200K epch:20.03 loss:0.029 grdn:0.042 lr:1.0e-04 updt_s:0.011 data_s:0.040
+INFO 2026-05-24 18:37:03 ot_train.py:433 step:55K smpl:28M ep:204K epch:20.40 loss:0.029 grdn:0.041 lr:1.0e-04 updt_s:0.011 data_s:0.037
+INFO 2026-05-24 18:37:51 ot_train.py:433 step:56K smpl:29M ep:208K epch:20.77 loss:0.029 grdn:0.043 lr:1.0e-04 updt_s:0.011 data_s:0.037
+INFO 2026-05-24 18:38:43 ot_train.py:433 step:57K smpl:29M ep:211K epch:21.14 loss:0.029 grdn:0.043 lr:1.0e-04 updt_s:0.011 data_s:0.040
+INFO 2026-05-24 18:39:31 ot_train.py:433 step:58K smpl:30M ep:215K epch:21.51 loss:0.029 grdn:0.043 lr:1.0e-04 updt_s:0.011 data_s:0.037
+INFO 2026-05-24 18:40:22 ot_train.py:433 step:59K smpl:30M ep:219K epch:21.88 loss:0.029 grdn:0.042 lr:1.0e-04 updt_s:0.011 data_s:0.040
+INFO 2026-05-24 18:41:09 ot_train.py:433 step:60K smpl:31M ep:223K epch:22.25 loss:0.029 grdn:0.044 lr:1.0e-04 updt_s:0.011 data_s:0.037
+INFO 2026-05-24 18:41:09 ot_train.py:453 Checkpoint policy after step 60000
+INFO 2026-05-24 18:41:09 ot_train.py:524 End of training
