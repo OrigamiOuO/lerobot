@@ -80,8 +80,11 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
     Returns:
         LeRobotDataset | MultiLeRobotDataset
     """
+    image_transforms_cfg = cfg.dataset.image_transforms
     image_transforms = (
-        ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
+        ImageTransforms(image_transforms_cfg)
+        if image_transforms_cfg.enable or image_transforms_cfg.inhand_camera_jitter.enable
+        else None
     )
 
     if isinstance(cfg.dataset.repo_id, str):

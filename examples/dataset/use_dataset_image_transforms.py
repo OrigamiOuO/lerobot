@@ -55,7 +55,7 @@ def example_1_default_transforms():
 
         # Load dataset with transforms enabled
         transforms_config = ImageTransformsConfig(
-            enable=True,  # Enable transforms (disabled by default)
+            enable=True,  # Enable transforms
             max_num_transforms=2,  # Apply up to 2 transforms per frame
             random_order=False,  # Apply in standard order
         )

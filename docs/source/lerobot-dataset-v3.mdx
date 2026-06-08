@@ -167,7 +167,7 @@ Use the `image_transforms` parameter when loading a dataset for training:
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.transforms import ImageTransforms, ImageTransformsConfig, ImageTransformConfig
 
-# Option 1: Use default transform configuration (disabled by default)
+# Option 1: Use default transform configuration
 transforms_config = ImageTransformsConfig(
     enable=True,  # Enable transforms
     max_num_transforms=3,  # Apply up to 3 transforms per frame
@@ -236,6 +236,7 @@ You can also use any `torchvision.transforms.v2` transform by passing it directl
 ### Configuration options
 
 - **`enable`**: Enable/disable transforms (default: `False`)
+- **`inhand_camera_jitter`**: Extra light affine jitter for `inhand` camera frames, enabled by default independently from the standard transforms.
 - **`max_num_transforms`**: Maximum number of transforms applied per frame (default: `3`)
 - **`random_order`**: Apply transforms in random order vs. standard order (default: `False`)
 - **`weight`**: Sampling probability for each transform (higher = more likely, if sum of weights is not 1, they will be normalized)

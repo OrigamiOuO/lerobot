@@ -163,6 +163,24 @@ class ImageTransformConfig:
 
 
 @dataclass
+class InhandCameraJitterConfig:
+    """Extra camera pose jitter for small accidental inhand camera bumps."""
+
+    enable: bool = True
+    apply_to: list[str] | None = field(default_factory=lambda: ["inhand"])
+    weight: float = 2.0
+    identity_weight: float = 1.0
+    kwargs: dict[str, Any] = field(
+        default_factory=lambda: {
+            "degrees": (-2.0, 2.0),
+            "translate": (0.04, 0.0),
+            "shear": (-2.0, 2.0),
+            "scale": (0.98, 1.02),
+        }
+    )
+
+
+@dataclass
 class ImageTransformsConfig:
     """
     These transforms are all using standard torchvision.transforms.v2
@@ -171,7 +189,7 @@ class ImageTransformsConfig:
     We use a custom RandomSubsetApply container to sample them.
     """
 
-    # Set this flag to `true` to enable transforms during training
+    # Set this flag to `true` to enable the standard image transforms during training.
     enable: bool = False
     # Restrict transforms to specific visual keys. Entries can be full keys like
     # `observation.images.global` or suffixes like `global`.
@@ -182,6 +200,9 @@ class ImageTransformsConfig:
     # By default, transforms are applied in Torchvision's suggested order (shown below).
     # Set this to True to apply them in a random order.
     random_order: bool = False
+    # Extra small pose jitter for the inhand camera. This is independent from the standard transforms above,
+    # so enabling brightness/contrast/etc. still works as before.
+    inhand_camera_jitter: InhandCameraJitterConfig = field(default_factory=InhandCameraJitterConfig)
     tfs: dict[str, ImageTransformConfig] = field(
         default_factory=lambda: {
             "brightness": ImageTransformConfig(
@@ -238,6 +259,9 @@ class ImageTransforms(Transform):
         super().__init__()
         self._cfg = cfg
         self.apply_to = list(cfg.apply_to) if cfg.apply_to else None
+        self.inhand_camera_jitter_apply_to = (
+            list(cfg.inhand_camera_jitter.apply_to) if cfg.inhand_camera_jitter.apply_to else None
+        )
 
         self.weights = []
         self.transforms = {}
@@ -259,11 +283,47 @@ class ImageTransforms(Transform):
                 random_order=cfg.random_order,
             )
 
+        jitter_cfg = cfg.inhand_camera_jitter
+        if jitter_cfg.enable:
+            self.inhand_camera_jitter_tf = RandomSubsetApply(
+                transforms=[v2.Identity(), v2.RandomAffine(**jitter_cfg.kwargs)],
+                p=[jitter_cfg.identity_weight, jitter_cfg.weight],
+                n_subset=1,
+                random_order=False,
+            )
+        else:
+            self.inhand_camera_jitter_tf = v2.Identity()
+
     def forward(self, *inputs: Any) -> Any:
         return self.tf(*inputs)
 
     def should_apply(self, key: str) -> bool:
-        if self.apply_to is None:
-            return True
+        return self.should_apply_standard_transforms(key) or self.should_apply_inhand_camera_jitter(key)
 
-        return any(key == candidate or key.endswith(f".{candidate}") for candidate in self.apply_to)
+    def should_apply_standard_transforms(self, key: str) -> bool:
+        return self._cfg.enable and _matches_apply_to(key, self.apply_to)
+
+    def should_apply_inhand_camera_jitter(self, key: str) -> bool:
+        return self._cfg.inhand_camera_jitter.enable and _matches_apply_to(
+            key, self.inhand_camera_jitter_apply_to
+        )
+
+    def apply_to_key(self, key: str, *inputs: Any) -> Any:
+        needs_unpacking = len(inputs) > 1
+
+        if self.should_apply_standard_transforms(key):
+            outputs = self.tf(*inputs)
+            inputs = outputs if needs_unpacking else (outputs,)
+
+        if self.should_apply_inhand_camera_jitter(key):
+            outputs = self.inhand_camera_jitter_tf(*inputs)
+            inputs = outputs if needs_unpacking else (outputs,)
+
+        return inputs if needs_unpacking else inputs[0]
+
+
+def _matches_apply_to(key: str, apply_to: list[str] | None) -> bool:
+    if apply_to is None:
+        return True
+
+    return any(key == candidate or key.endswith(f".{candidate}") for candidate in apply_to)

@@ -338,7 +338,10 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             if self.image_transforms is not None:
                 image_keys = self.meta.camera_keys
                 for cam in image_keys:
-                    video_frames[cam] = self.image_transforms(video_frames[cam])
+                    if hasattr(self.image_transforms, "apply_to_key"):
+                        video_frames[cam] = self.image_transforms.apply_to_key(cam, video_frames[cam])
+                    elif not hasattr(self.image_transforms, "should_apply") or self.image_transforms.should_apply(cam):
+                        video_frames[cam] = self.image_transforms(video_frames[cam])
 
             updates.append(video_frames)
 
