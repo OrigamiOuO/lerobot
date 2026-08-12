@@ -1775,6 +1775,7 @@ class SparshTactileRawEncoder(nn.Module):
         checkpoint_path = hf_hub_download(
             repo_id=config.sparsh_model_name,
             filename=config.sparsh_checkpoint_filename,
+            local_files_only=True,
         )
         checkpoint = self._load_checkpoint_file(checkpoint_path)
         encoder_state = self._extract_official_encoder_state(checkpoint, config.sparsh_ssl_name)

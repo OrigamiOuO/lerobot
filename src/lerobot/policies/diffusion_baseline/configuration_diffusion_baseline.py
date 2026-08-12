@@ -118,9 +118,9 @@ class DiffusionBaselineConfig(PreTrainedConfig):
     use_marker_motion: bool = True
 
     # Inputs / output structure.
-    n_obs_steps: int = 2
-    horizon: int = 8
-    n_action_steps: int = 4
+    n_obs_steps: int = 4
+    horizon: int = 24
+    n_action_steps: int = 8
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
